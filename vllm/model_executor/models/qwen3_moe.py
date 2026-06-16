@@ -706,12 +706,9 @@ class Qwen3MoeModel(nn.Module):
         loaded_params: set[str] = set()
         expert_params_mapping = self.get_expert_mapping()
 
-        # NOTE: Determine what weights to load based on split mode
+        # Determine what weights to load based on split mode
         load_attention = not self.is_split_moe_mode
         load_moe = not self.is_split_attn_mode
-        if not(load_attention or load_moe):
-            load_attention = True
-            load_moe = True
 
         for name, loaded_weight in weights:
             # Skip attention weights in MoE mode

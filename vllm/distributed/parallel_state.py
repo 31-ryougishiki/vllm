@@ -1218,23 +1218,6 @@ def is_split_moe_rank() -> bool:
   return rank >= split_tp_size
 
 
-def get_split_group_info() -> tuple[int, int, int]:
-  """Get split group info: (group_type, rank_in_group, group_size)"""
-  from vllm.config import get_current_vllm_config
-  config = get_current_vllm_config()
-  rank = torch.distributed.get_rank()
-
-  if config is None:
-      return (0, 0, 1)
-
-  split_tp_size = config.parallel_config.split_tp_size
-  split_ep_size = config.parallel_config.split_ep_size
-
-  if rank < split_tp_size:
-      return (0, rank, split_tp_size)
-  else:
-      return (1, rank - split_tp_size, split_ep_size)
-
 def is_split_attn_enabled() -> bool:
   return _SPLIT_ATTN_GROUP is not None or _SPLIT_MOE_GROUP is not None
 
