@@ -1139,7 +1139,6 @@ def init_split_attn_moe_group(split_tp_size: int, split_ep_size: int) -> None:
   backend = torch.distributed.get_backend(get_world_group().device_group)
 
   if _SPLIT_ATTN_GROUP is not None or _SPLIT_MOE_GROUP is not None:
-      print(f"init_split_attn_moe_group directly return, rank={rank}", flush=True)
       return  # Already initialized
 
   # NOTE: This implementation does not support data parallelism
@@ -1197,12 +1196,10 @@ def get_split_moe_group() -> GroupCoordinator | None:
 
 def is_split_attn_rank() -> bool:
   if not torch.distributed.is_initialized():
-      print("is_split_attn_rank called, not initialized")
       return False
   from vllm.config import get_current_vllm_config
   config = get_current_vllm_config()
   if config is None:
-      print("is_split_attn_rank called, configg None")
       return False
   rank = torch.distributed.get_rank()
   split_tp_size = config.parallel_config.split_tp_size

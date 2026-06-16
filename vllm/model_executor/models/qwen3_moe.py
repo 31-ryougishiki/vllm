@@ -79,6 +79,20 @@ from .utils import (
 
 logger = init_logger(__name__)
 
+# Weight name prefixes for split attention/MoE mode weight filtering.
+# Used in load_weights to determine which weights belong to each sub-group.
+_ATTN_WEIGHT_PREFIXES = (
+    ".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj",
+    ".self_attn.o_proj", ".attn.q_proj", ".attn.k_proj",
+    ".attn.v_proj", ".attn.o_proj", "qkv_proj",
+    ".self_attn.k_norm", ".self_attn.q_norm",
+)
+_MOE_WEIGHT_PREFIXES = (
+    ".mlp.experts.", "experts.gate", "experts.up_proj",
+    "experts.down_proj", ".mlp.gate.", ".mlp.gate.weight",
+    ".mlp.gate_up_proj", ".mlp.shared_experts.",
+)
+
 
 class Qwen3MoeMLP(nn.Module):
     def __init__(
@@ -700,36 +714,15 @@ class Qwen3MoeModel(nn.Module):
             load_moe = True
 
         for name, loaded_weight in weights:
-            # NOTE: Skip attention weights in moe mode
-            if not load_attention and (
-                ".self_attn.q_proj" in name or
-                ".self_attn.k_proj" in name or
-                ".self_attn.v_proj" in name or
-                ".self_attn.o_proj" in name or
-                ".attn.q_proj" in name or
-                ".attn.k_proj" in name or
-                ".attn.v_proj" in name or
-                ".attn.o_proj" in name or
-                "qkv_proj" in name or
-                ".self_attn.k_norm" in name or
-                ".self_attn.q_norm" in name
-            ):
+            # Skip attention weights in MoE mode
+            if not load_attention and any(p in name for p in _ATTN_WEIGHT_PREFIXES):
                 continue
 
             # Skip MoE weights in attn mode
-            if not load_moe and (
-                ".mlp.experts." in name or
-                "experts.gate" in name or
-                "experts.up_proj" in name or
-                "experts.down_proj" in name or
-                ".mlp.gate." in name or
-                ".mlp.gate.weight" in name or
-                ".mlp.gate_up_proj" in name or
-                ".mlp.shared_experts." in name  # NOTE: shared_experts 属于 MoE 部分
-            ):
+            if not load_moe and any(p in name for p in _MOE_WEIGHT_PREFIXES):
                 continue
 
-            # NOTE: [split] MoE mode不需要embed_tokens
+            # MoE rank does not need embed_tokens
             if not load_attention and "embed_tokens" in name:
                 continue
 
