@@ -567,9 +567,19 @@ class Qwen3MoeModel(nn.Module):
             # (2026-04-15 fix - create dummy to avoid crash)
             self.embed_tokens = None
 
+        import time as _time
+        _rank = torch.distributed.get_rank()
+        def _make_layer(prefix):
+            _t0 = _time.time()
+            layer = Qwen3MoeDecoderLayer(vllm_config=vllm_config, prefix=prefix)
+            _dt = _time.time() - _t0
+            if _dt > 0.5:
+                logger.info("[DEBUG][Rank %d] make_layers: %s took %.2fs",
+                            _rank, prefix, _dt)
+            return layer
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: Qwen3MoeDecoderLayer(vllm_config=vllm_config, prefix=prefix),
+            _make_layer,
             prefix=f"{prefix}.layers",
         )
         logger.info("[DEBUG][Rank %d] Qwen3MoeModel: make_layers done (%d layers)",
