@@ -140,6 +140,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        _dbg_rank = torch.distributed.get_rank()
+        logger.info("[DEBUG][Rank %d] SparseMoeBlock.%s: entered",
+                    _dbg_rank, prefix)
 
         config = vllm_config.model_config.hf_text_config
         parallel_config = vllm_config.parallel_config
@@ -181,6 +184,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             self.physical_expert_start + self.n_local_physical_experts
         )
 
+        logger.info("[DEBUG][Rank %d] SparseMoeBlock.%s: before FusedMoE, ep_size=%d",
+                    _dbg_rank, prefix, self.ep_size)
         self.experts = FusedMoE(
             num_experts=self.n_routed_experts,
             top_k=config.num_experts_per_tok,
@@ -195,8 +200,18 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             is_sequence_parallel=self.is_sequence_parallel,
             routing_method_type=RoutingMethodType.Renormalize,
         )
+        logger.info("[DEBUG][Rank %d] SparseMoeBlock.%s: FusedMoE done",
+                    _dbg_rank, prefix)
 
         self.gate = ReplicatedLinear(
+            config.hidden_size,
+            config.num_experts,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate",
+        )
+        logger.info("[DEBUG][Rank %d] SparseMoeBlock.%s: done",
+                    _dbg_rank, prefix)
             config.hidden_size,
             config.num_experts,
             bias=False,
