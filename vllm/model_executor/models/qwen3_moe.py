@@ -566,6 +566,8 @@ class Qwen3MoeModel(nn.Module):
             lambda prefix: Qwen3MoeDecoderLayer(vllm_config=vllm_config, prefix=prefix),
             prefix=f"{prefix}.layers",
         )
+        logger.info("[DEBUG][Rank %d] Qwen3MoeModel: make_layers done (%d layers)",
+                    torch.distributed.get_rank(), len(self.layers))
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
@@ -882,9 +884,13 @@ class Qwen3MoeForCausalLM(
         # Only perform the following mapping when Qwen3MoeMLP exists
         if getattr(config, "mlp_only_layers", []):
             self.packed_modules_mapping["gate_up_proj"] = ["gate_proj", "up_proj"]
+        logger.info("[DEBUG][Rank %d] Qwen3MoeForCausalLM: before Qwen3MoeModel",
+                    torch.distributed.get_rank())
         self.model = Qwen3MoeModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        logger.info("[DEBUG][Rank %d] Qwen3MoeForCausalLM: after Qwen3MoeModel, before lm_head",
+                    torch.distributed.get_rank())
 
         # NOTE: split模式下，MoE rank不初始化lm_head
         parallel_config = vllm_config.parallel_config
@@ -912,6 +918,9 @@ class Qwen3MoeForCausalLM(
             self.model.make_empty_intermediate_tensors
         )
 
+        logger.info("[DEBUG][Rank %d] Qwen3MoeForCausalLM: before layer loop",
+                    torch.distributed.get_rank())
+
         # Set MoE hyperparameters
         self.expert_weights = []
 
@@ -925,6 +934,9 @@ class Qwen3MoeForCausalLM(
             if isinstance(layer.mlp, Qwen3MoeSparseMoeBlock):
                 example_layer = layer.mlp
                 self.moe_layers.append(layer.mlp.experts)
+
+        logger.info("[DEBUG][Rank %d] Qwen3MoeForCausalLM: after layer loop, example_layer=%s",
+                    torch.distributed.get_rank(), example_layer is not None)
 
         if example_layer is None:
             # NOTE: [split] early escape
