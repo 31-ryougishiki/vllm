@@ -345,6 +345,11 @@ class Qwen3MoeDecoderLayer(nn.Module):
         quant_config = vllm_config.quant_config
         parallel_config = vllm_config.parallel_config # NOTE: lqf
 
+        _dbg_rank = torch.distributed.get_rank()
+        _dbg_prefix = prefix
+        logger.info("[DEBUG][Rank %d] DecoderLayer.%s: entered",
+                    _dbg_rank, _dbg_prefix)
+
         self.hidden_size = config.hidden_size
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         dual_chunk_attention_config = getattr(
@@ -359,6 +364,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
             self.is_split_attn_mode = is_split_attn_rank()
             self.is_split_moe_mode = is_split_moe_rank()
         if self.is_split_attn_mode or (parallel_config.split_tp_size == 0):
+            logger.info("[DEBUG][Rank %d] DecoderLayer.%s: creating self_attn",
+                        _dbg_rank, _dbg_prefix)
             self.self_attn = Qwen3MoeAttention(
                 hidden_size=self.hidden_size,
                 num_heads=config.num_attention_heads,
@@ -385,6 +392,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
         # NOTE: mlp should be None only when using split mode AND current rank is attn rank
         # In normal mode (split_tp_size=0 or split_ep_size=0), mlp should always be created
+        logger.info("[DEBUG][Rank %d] DecoderLayer.%s: before mlp, layer_idx=%d",
+                    _dbg_rank, _dbg_prefix, layer_idx)
         if (parallel_config.split_tp_size > 0 and parallel_config.split_ep_size > 0
                 and not self.is_split_moe_mode):
             self.mlp = None
@@ -392,10 +401,14 @@ class Qwen3MoeDecoderLayer(nn.Module):
               if (layer_idx not in mlp_only_layers) and (
                   config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
               ):
+                  logger.info("[DEBUG][Rank %d] DecoderLayer.%s: creating SparseMoeBlock",
+                              _dbg_rank, _dbg_prefix)
                   self.mlp = Qwen3MoeSparseMoeBlock(
                       vllm_config=vllm_config, prefix=f"{prefix}.mlp"
                   )
               else:
+                  logger.info("[DEBUG][Rank %d] DecoderLayer.%s: creating Qwen3MoeMLP",
+                              _dbg_rank, _dbg_prefix)
                   self.mlp = Qwen3MoeMLP(
                       hidden_size=config.hidden_size,
                       intermediate_size=config.intermediate_size,
@@ -403,10 +416,14 @@ class Qwen3MoeDecoderLayer(nn.Module):
                       quant_config=quant_config,
                       prefix=f"{prefix}.mlp",
                   )
+        logger.info("[DEBUG][Rank %d] DecoderLayer.%s: mlp done, creating norms",
+                    _dbg_rank, _dbg_prefix)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        logger.info("[DEBUG][Rank %d] DecoderLayer.%s: done",
+                    _dbg_rank, _dbg_prefix)
 
     def forward(
         self,
