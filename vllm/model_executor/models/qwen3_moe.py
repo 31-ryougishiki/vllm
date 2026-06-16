@@ -212,12 +212,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         )
         logger.info("[DEBUG][Rank %d] SparseMoeBlock.%s: done",
                     _dbg_rank, prefix)
-            config.hidden_size,
-            config.num_experts,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.gate",
-        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert hidden_states.dim() <= 2, (
