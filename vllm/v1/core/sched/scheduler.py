@@ -119,32 +119,6 @@ class Scheduler(SchedulerInterface):
         )
         self.prev_step_scheduled_req_ids: set[str] = set()
 
-    def _allocate_kv_blocks(
-        self,
-        request,
-        num_tokens: int,
-        num_new_local_computed_tokens: int = 0,
-        new_computed_blocks: list | None = None,
-        num_lookahead_tokens: int = 0,
-        delay_cache_blocks: bool = False,
-        num_encoder_tokens: int = 0,
-    ):
-        """Allocate KV cache blocks, with split-mode fallback for MoE ranks."""
-        new_blocks = self.kv_cache_manager.allocate_slots(
-            request,
-            num_tokens,
-            num_new_local_computed_tokens,
-            new_computed_blocks,
-            num_lookahead_tokens=num_lookahead_tokens,
-            delay_cache_blocks=delay_cache_blocks,
-            num_encoder_tokens=num_encoder_tokens,
-        )
-        # In split mode, MoE ranks don't need KV cache.
-        # If allocation fails, use empty blocks to allow scheduling to proceed.
-        if new_blocks is None and self.is_split_mode:
-            new_blocks = self.kv_cache_manager.empty_kv_cache_blocks
-        return new_blocks
-
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
         self.max_num_scheduled_tokens = self.scheduler_config.max_num_batched_tokens
@@ -264,6 +238,30 @@ class Scheduler(SchedulerInterface):
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
+
+    def _allocate_kv_blocks(
+        self,
+        request,
+        num_tokens: int,
+        num_new_local_computed_tokens: int = 0,
+        new_computed_blocks: list | None = None,
+        num_lookahead_tokens: int = 0,
+        delay_cache_blocks: bool = False,
+        num_encoder_tokens: int = 0,
+    ):
+        """Allocate KV cache blocks, with split-mode fallback for MoE ranks."""
+        new_blocks = self.kv_cache_manager.allocate_slots(
+            request,
+            num_tokens,
+            num_new_local_computed_tokens,
+            new_computed_blocks,
+            num_lookahead_tokens=num_lookahead_tokens,
+            delay_cache_blocks=delay_cache_blocks,
+            num_encoder_tokens=num_encoder_tokens,
+        )
+        if new_blocks is None and self.is_split_mode:
+            new_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+        return new_blocks
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
