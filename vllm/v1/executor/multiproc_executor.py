@@ -96,6 +96,7 @@ class MultiprocExecutor(Executor):
         self.monitor_workers = monitor_workers
         super().__init__(vllm_config)
 
+
     def _init_executor(self) -> None:
         # Call self.shutdown at exit to clean up
         # and ensure workers will be terminated.
@@ -111,7 +112,11 @@ class MultiprocExecutor(Executor):
             f"({self.parallel_config.nnodes_within_dp}). "
         )
         self.local_world_size = self.parallel_config.local_world_size
-        tp_size = self.parallel_config.tensor_parallel_size
+        # Use effective TP size: if split_tp_size > 0, use split_tp_size + split_ep_size
+        if self.parallel_config.split_tp_size > 0:
+            tp_size = self.parallel_config.split_tp_size + self.parallel_config.split_ep_size
+        else:
+            tp_size = self.parallel_config.tensor_parallel_size
         pp_size = self.parallel_config.pipeline_parallel_size
         pcp_size = self.parallel_config.prefill_context_parallel_size
         assert self.world_size == tp_size * pp_size * pcp_size, (
@@ -416,6 +421,14 @@ class MultiprocExecutor(Executor):
         return self.parallel_config.pipeline_parallel_size
 
     def _get_output_rank(self) -> int:
+        # [FIX] In split mode (attn + moe), only attn rank 0 should return output
+        # Split mode: split_tp_size GPUs for attn, split_ep_size GPUs for moe
+        # We want only the first attn rank (global rank 0) to return ModelRunnerOutput
+        if (self.parallel_config.split_tp_size > 0
+                and self.parallel_config.split_ep_size > 0):
+            # In split mode, return rank 0 (attn group's first rank)
+            return 0
+
         # Only returns ModelRunnerOutput from TP rank=0 and PP rank=-1
         # (the first TP worker of the last PP stage).
         # Example:
@@ -551,6 +564,12 @@ class WorkerProc:
 
         # Initialize device
         self.worker.init_device()
+
+        # NOTE: [lqf] 在 setup_proc_title_and_log_prefix 之前设置全局 config
+        # 使 is_split_attn_enabled() 能正确识别 split 模式
+        from vllm.config.vllm import _current_vllm_config
+        import vllm.config.vllm as vllm_module
+        vllm_module._current_vllm_config = vllm_config
 
         # Set process title and log prefix
         self.setup_proc_title_and_log_prefix(
@@ -833,14 +852,33 @@ class WorkerProc:
 
     @staticmethod
     def setup_proc_title_and_log_prefix(enable_ep: bool) -> None:
+        from vllm.distributed import (
+            get_split_attn_group,
+            get_split_moe_group,
+            is_split_attn_rank,
+            is_split_attn_enabled,
+        )
+
         dp_size = get_dp_group().world_size
         dp_rank = get_dp_group().rank_in_group
         pp_size = get_pp_group().world_size
         pp_rank = get_pp_group().rank_in_group
         pcp_size = get_pcp_group().world_size
         pcp_rank = get_pcp_group().rank_in_group
-        tp_size = get_tp_group().world_size
-        tp_rank = get_tp_group().rank_in_group
+
+        # NOTE: split模式下使用split_attn_group或split_moe_group
+        is_split_mode = is_split_attn_enabled()
+        if is_split_mode:
+            split_attn_group = get_split_attn_group()
+            split_moe_group = get_split_moe_group()
+            tp_size = split_attn_group.world_size if split_attn_group else 0
+            tp_rank = split_attn_group.rank_in_group if split_attn_group else None
+            ep_size = split_moe_group.world_size if split_moe_group else 0
+            ep_rank = split_moe_group.rank_in_group if split_moe_group else None
+        else:
+            tp_size = get_tp_group().world_size
+            tp_rank = get_tp_group().rank_in_group
+
         dcp_size = get_dcp_group().world_size
         dcp_rank = get_dcp_group().rank_in_group
         process_name = "Worker"
@@ -850,13 +888,17 @@ class WorkerProc:
             process_name += f"_PP{pp_rank}"
         if pcp_size > 1:
             process_name += f"_PCP{pcp_rank}"
-        if tp_size > 1:
+        if tp_size > 1 or is_split_mode:
             process_name += f"_TP{tp_rank}"
         if dcp_size > 1:
             process_name += f"_DCP{dcp_rank}"
+        # NOTE: split模式下使用split_moe_group的rank
         if enable_ep:
-            ep_rank = get_ep_group().rank_in_group
-            process_name += f"_EP{ep_rank}"
+            if is_split_mode:
+                process_name += f"_EP{ep_rank}"
+            else:
+                ep_rank = get_ep_group().rank_in_group
+                process_name += f"_EP{ep_rank}"
         set_process_title(name=process_name)
         decorate_logs(process_name)
 

@@ -84,6 +84,32 @@ class Scheduler(SchedulerInterface):
         self.structured_output_manager = structured_output_manager
         self.is_encoder_decoder = vllm_config.model_config.is_encoder_decoder
 
+        # [FIX] Split mode detection: check if this is a moe rank that doesn't need KV cache
+        # Use parallel_config directly instead of is_split_attn_enabled() because
+        # split group may not be initialized yet when scheduler is created.
+        self.is_split_mode = (
+            vllm_config.parallel_config.split_tp_size > 0
+            and vllm_config.parallel_config.split_ep_size > 0
+        )
+        # In single EngineCoreProc process, we can't easily determine if current rank is moe or attn.
+        # So we use a simpler approach: if split mode is enabled, check if we need KV cache
+        # based on the available memory. Alternatively, use is_split_moe_rank if available.
+        self.is_split_moe_rank = False
+        self.is_split_attn_rank = False
+        if self.is_split_mode:
+            try:
+                from vllm.distributed import (
+                    is_split_attn_enabled,
+                    is_split_moe_rank,
+                    is_split_attn_rank,
+                )
+                # Try to get the actual rank info if split group is initialized
+                if is_split_attn_enabled():
+                    self.is_split_moe_rank = is_split_moe_rank()
+                    self.is_split_attn_rank = is_split_attn_rank()
+            except ImportError:
+                pass
+
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
         # by update_from_outputs(). This is currently used in the multi-engine
@@ -315,11 +341,24 @@ class Scheduler(SchedulerInterface):
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
-                    new_blocks = self.kv_cache_manager.allocate_slots(
-                        request,
-                        num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens,
-                    )
+                    import os
+                    # [FIX] In split mode, allow scheduling to succeed even if KV cache allocation fails.
+                    if self.is_split_mode:
+                        rank = os.environ.get("RANK", "0")
+                        new_blocks = self.kv_cache_manager.allocate_slots(
+                            request,
+                            num_new_tokens,
+                            num_lookahead_tokens=self.num_lookahead_tokens,
+                        )
+                        # If allocation fails in split mode, use empty blocks to allow scheduling
+                        if new_blocks is None:
+                            new_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+                    else:
+                        new_blocks = self.kv_cache_manager.allocate_slots(
+                            request,
+                            num_new_tokens,
+                            num_lookahead_tokens=self.num_lookahead_tokens,
+                        )
 
                     if new_blocks is not None:
                         # The request can be scheduled.
@@ -580,15 +619,32 @@ class Scheduler(SchedulerInterface):
                 else:
                     num_encoder_tokens = 0
 
-                new_blocks = self.kv_cache_manager.allocate_slots(
-                    request,
-                    num_new_tokens + num_external_computed_tokens,
-                    num_new_local_computed_tokens,
-                    new_computed_blocks,
-                    num_lookahead_tokens=effective_lookahead_tokens,
-                    delay_cache_blocks=load_kv_async,
-                    num_encoder_tokens=num_encoder_tokens,
-                )
+                # [FIX] In split mode, allow scheduling to succeed even if KV cache allocation fails.
+                # This is needed because in split mode, moe ranks don't need KV cache.
+                # Also, in single EngineCoreProc process, we can't easily distinguish attn/moe ranks.
+                if self.is_split_mode:
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        num_new_tokens + num_external_computed_tokens,
+                        num_new_local_computed_tokens,
+                        new_computed_blocks,
+                        num_lookahead_tokens=effective_lookahead_tokens,
+                        delay_cache_blocks=load_kv_async,
+                        num_encoder_tokens=num_encoder_tokens,
+                    )
+                    # If allocation fails in split mode, use empty blocks to allow scheduling
+                    if new_blocks is None:
+                        new_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+                else:
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        num_new_tokens + num_external_computed_tokens,
+                        num_new_local_computed_tokens,
+                        new_computed_blocks,
+                        num_lookahead_tokens=effective_lookahead_tokens,
+                        delay_cache_blocks=load_kv_async,
+                        num_encoder_tokens=num_encoder_tokens,
+                    )
 
                 if new_blocks is None:
                     # The request cannot be scheduled.

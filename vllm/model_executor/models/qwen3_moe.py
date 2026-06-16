@@ -37,6 +37,7 @@ from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
@@ -137,7 +138,13 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.ep_size = self.ep_group.size()
         self.n_routed_experts = config.num_experts
 
-        self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+        # NOTE: [split] In split mode, MoE ranks don't have TP group,
+        # so disable sequence parallel to avoid all_gather errors
+        from vllm.distributed import is_split_attn_enabled
+        if is_split_attn_enabled():
+            self.is_sequence_parallel = False
+        else:
+            self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
 
         if self.tp_size > config.num_experts:
             raise ValueError(
@@ -225,10 +232,13 @@ class Qwen3MoeAttention(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         dual_chunk_attention_config: dict[str, Any] | None = None,
+        split_tp_size: int = 0,  # NOTE: lqf
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        # NOTE: [split] 如果指定了split_tp_size，使用它；否则使用全局TP size
+        # tp_size = get_tensor_model_parallel_world_size()
+        tp_size = split_tp_size if split_tp_size > 0 else get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -299,15 +309,14 @@ class Qwen3MoeAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        # Add qk-norm
         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
         q_by_head = self.q_norm(q_by_head)
         q = q_by_head.view(q.shape)
-
         k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
         k_by_head = self.k_norm(k_by_head)
         k = k_by_head.view(k.shape)
-        q, k = self.rotary_emb(positions, q, k)
+        if positions.numel() > 0 and q.shape[0] > 0:
+            q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
@@ -320,46 +329,66 @@ class Qwen3MoeDecoderLayer(nn.Module):
         config = vllm_config.model_config.hf_text_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
+        parallel_config = vllm_config.parallel_config # NOTE: lqf
 
         self.hidden_size = config.hidden_size
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         dual_chunk_attention_config = getattr(
             config, "dual_chunk_attention_config", None
         )
-        self.self_attn = Qwen3MoeAttention(
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            rope_parameters=config.rope_parameters,
-            max_position_embeddings=max_position_embeddings,
-            rms_norm_eps=config.rms_norm_eps,
-            qkv_bias=getattr(config, "attention_bias", False),
-            head_dim=getattr(config, "head_dim", None),
-            cache_config=cache_config,
-            quant_config=quant_config,
-            prefix=f"{prefix}.self_attn",
-            dual_chunk_attention_config=dual_chunk_attention_config,
-        )
 
+        # NOTE: Get split attn/moe mode
+        self.is_split_attn_mode = False
+        self.is_split_moe_mode = False
+        if parallel_config.split_tp_size > 0 and parallel_config.split_ep_size > 0:
+            from vllm.distributed import is_split_attn_rank, is_split_moe_rank
+            self.is_split_attn_mode = is_split_attn_rank()
+            self.is_split_moe_mode = is_split_moe_rank()
+        if self.is_split_attn_mode or (parallel_config.split_tp_size == 0):
+            self.self_attn = Qwen3MoeAttention(
+                hidden_size=self.hidden_size,
+                num_heads=config.num_attention_heads,
+                num_kv_heads=config.num_key_value_heads,
+                rope_parameters=config.rope_parameters,
+                max_position_embeddings=max_position_embeddings,
+                rms_norm_eps=config.rms_norm_eps,
+                qkv_bias=getattr(config, "attention_bias", False),
+                head_dim=getattr(config, "head_dim", None),
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.self_attn",
+                dual_chunk_attention_config=dual_chunk_attention_config,
+                split_tp_size=parallel_config.split_tp_size,  # NOTE: 新增
+            )
+        else:
+            self.self_attn = None
+
+        # NOTE: Only create MoE module in MOE mode (or when not using split mode)
         # `mlp_only_layers` in the config.
         layer_idx = extract_layer_index(prefix)
         mlp_only_layers = (
             [] if not hasattr(config, "mlp_only_layers") else config.mlp_only_layers
         )
-        if (layer_idx not in mlp_only_layers) and (
-            config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
-        ):
-            self.mlp = Qwen3MoeSparseMoeBlock(
-                vllm_config=vllm_config, prefix=f"{prefix}.mlp"
-            )
+        # NOTE: mlp should be None only when using split mode AND current rank is attn rank
+        # In normal mode (split_tp_size=0 or split_ep_size=0), mlp should always be created
+        if (parallel_config.split_tp_size > 0 and parallel_config.split_ep_size > 0
+                and not self.is_split_moe_mode):
+            self.mlp = None
         else:
-            self.mlp = Qwen3MoeMLP(
-                hidden_size=config.hidden_size,
-                intermediate_size=config.intermediate_size,
-                hidden_act=config.hidden_act,
-                quant_config=quant_config,
-                prefix=f"{prefix}.mlp",
-            )
+              if (layer_idx not in mlp_only_layers) and (
+                  config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
+              ):
+                  self.mlp = Qwen3MoeSparseMoeBlock(
+                      vllm_config=vllm_config, prefix=f"{prefix}.mlp"
+                  )
+              else:
+                  self.mlp = Qwen3MoeMLP(
+                      hidden_size=config.hidden_size,
+                      intermediate_size=config.intermediate_size,
+                      hidden_act=config.hidden_act,
+                      quant_config=quant_config,
+                      prefix=f"{prefix}.mlp",
+                  )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -372,19 +401,85 @@ class Qwen3MoeDecoderLayer(nn.Module):
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+        # NOTE: [split] For MoE rank, input_layernorm is not needed because
+        # the data received from attn group has already been processed through
+        # post_attention_layernorm. Skip input_layernorm to avoid computing on
+        # placeholder/dummy data.
+        if self.is_split_moe_mode:
+            # MoE rank: skip input_layernorm, data will come from recv_from_attn
+            if residual is None:
+                residual = hidden_states
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-        )
+            # Attn rank or non-split mode: normal input_layernorm
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        # NOTE: In split mode, handle cross-group communication
+        if self.is_split_attn_mode and self.self_attn is not None:
+            # Attn group: compute attention -> send to moe -> recv from moe
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+
+            # Import and call cross-group communication
+            from vllm_ascend.distributed.split_attn_moe_communicator import (
+                send_to_moe,
+                recv_from_moe,
+            )
+            # Send to moe group (directly uses hidden_states)
+            send_to_moe(hidden_states)
+            # Receive from moe group directly into hidden_states
+            hidden_states = recv_from_moe(hidden_states)
+
+            # [FIX] After recv_from_moe, need all_reduce to combine outputs from both moe ranks
+            # In split mode, attn_rank 0 gets moe_rank 0 output, attn_rank 1 gets moe_rank 1 output
+            # They need to be combined via all_reduce
+            from vllm.distributed import tensor_model_parallel_all_reduce
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        elif self.is_split_moe_mode and self.mlp is not None:
+            # Moe group: recv from attn -> compute moe -> send to attn
+            # NOTE: [split] Data received from attn has already been processed through
+            # post_attention_layernorm, so we should NOT apply it again.
+            # (2026-04-15 fix: removed redundant post_attention_layernorm)
+            from vllm_ascend.distributed.split_attn_moe_communicator import (
+                recv_from_attn,
+                send_to_attn,
+            )
+            # Receive from attn group directly into hidden_states
+            hidden_states = recv_from_attn(hidden_states)
+            # Skip post_attention_layernorm - data is already normalized
+            # hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
+            # Compute MoE
+            hidden_states = self.mlp(hidden_states)
+            # Send back to attn group
+            send_to_attn(hidden_states)
+
+            # Set hidden_states to None as result is already sent
+            hidden_states = None
+        else:
+            # Non-split mode: normal forward
+            if self.self_attn is not None:
+                hidden_states = self.self_attn(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                )
+
+            # Fully Connected
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+
+            if self.mlp is not None:
+                hidden_states = self.mlp(hidden_states)
+
         return hidden_states, residual
 
 
@@ -403,12 +498,55 @@ class Qwen3MoeModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.config = config
         self.quant_config = quant_config
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=f"{prefix}.embed_tokens",
-        )
+
+
+        # NOTE: Get split attn/moe mode for model structure
+        self.split_tp_size = parallel_config.split_tp_size
+        self.split_ep_size = parallel_config.split_ep_size
+        self.is_split_attn_mode = False
+        self.is_split_moe_mode = False
+
+        if self.split_tp_size > 0 and self.split_ep_size > 0:
+            from vllm.distributed import is_split_attn_rank, is_split_moe_rank
+            self.is_split_attn_mode = is_split_attn_rank()
+            self.is_split_moe_mode = is_split_moe_rank()
+
+            # Initialize cross-group communication
+            from vllm_ascend.distributed.split_attn_moe_communicator import (
+                init_cross_group,
+            )
+            init_cross_group(self.split_tp_size, self.split_ep_size)
+
+            logger.info(
+                f"[Rank {torch.distributed.get_rank()}] Split attn-moe mode: "
+                f"split_tp_size={self.split_tp_size}, split_ep_size={self.split_ep_size}, "
+                f"is_attn_mode={self.is_split_attn_mode}, is_moe_mode={self.is_split_moe_mode}"
+            )
+
+        # NOTE: [split] Create embed_tokens for attn ranks only.
+        # MoE ranks don't need embed_tokens during inference (they receive data from attn).
+        # For warmup, we'll handle moe rank specially in model_runner.
+        if self.is_split_attn_mode:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=f"{prefix}.embed_tokens",
+            )
+        elif self.split_tp_size == 0:
+            # Non-split mode: create embed_tokens normally
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=f"{prefix}.embed_tokens",
+            )
+        else:
+            # Split mode but not attn rank (moe rank): create a simple dummy embedding
+            # that returns zeros. This is used during warmup only.
+            # (2026-04-15 fix - create dummy to avoid crash)
+            self.embed_tokens = None
+
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: Qwen3MoeDecoderLayer(vllm_config=vllm_config, prefix=prefix),
@@ -421,7 +559,17 @@ class Qwen3MoeModel(nn.Module):
         # Track layers for auxiliary hidden state outputs (EAGLE3)
         self.aux_hidden_state_layers: tuple[int, ...] = ()
 
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # NOTE: [split] For moe rank during warmup, embed_tokens is None.
+        # Return dummy zeros with the right shape for recv_from_attn to work.
+        if self.embed_tokens is None:
+            # Create dummy hidden_states for warmup - the actual data will come
+            # from attn rank via recv_from_attn in each layer
+            return input_ids.new_zeros(
+                (input_ids.shape[0], self.config.hidden_size),
+                dtype=torch.bfloat16
+            )
         return self.embed_tokens(input_ids)
 
     def forward(
@@ -431,16 +579,34 @@ class Qwen3MoeModel(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        # TODO: [split] 计算流程需要适配, moe-rank不进行embed计算
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
+            # NOTE: [split] In split mode (tp=2, ep=2), we need additional all_reduce
+            # because VocabParallelEmbedding's internal all_reduce may not work correctly
+            # when the two ranks have different token embeddings (each rank has partial vocab).
+            # After embed, both ranks should have the same hidden_states.
+            if self.is_split_attn_mode and hidden_states is not None:
+                from vllm.distributed import tensor_model_parallel_all_reduce
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
             residual = None
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+
+        # NOTE: [split] For MoE rank, after each layer's forward sends result,
+        # hidden_states becomes None. We need a placeholder for the next layer's
+        # recv_from_attn to get the shape. This is only needed during warmup.
+        # Store dummy_shape for regenerating placeholder if needed.
+        dummy_shape = None
+        # Flag to track if we're in MoE placeholder mode (skip norm at the end)
+        is_moe_placeholder_mode = False
+        if self.is_split_moe_mode and hidden_states is not None:
+            dummy_shape = hidden_states.shape
 
         aux_hidden_states = []
         for layer_idx, layer in enumerate(
@@ -453,7 +619,26 @@ class Qwen3MoeModel(nn.Module):
                     hidden_states + residual if residual is not None else hidden_states
                 )
                 aux_hidden_states.append(aux_hidden_state)
+
+            # TODO: [split] 计算流程需要适配, layer分为layer-attn和layer-moe
+            # 对于只有layer-moe的rank，等待接收->计算->发送
+            # 对于只有layer-attn的rank，计算->发送->等待接收
             hidden_states, residual = layer(positions, hidden_states, residual)
+
+            # NOTE: [split] After MoE layer sends result, hidden_states becomes None.
+            # Need placeholder for next layer's recv_from_attn shape.
+            if self.is_split_moe_mode and hidden_states is None and dummy_shape is not None:
+                # Use the stored shape to create placeholder; actual data will come from recv_from_attn
+                # Must use same device as the original input (NPU), not CPU
+                placeholder_device = input_ids.device if input_ids is not None else "cpu"
+                hidden_states = torch.empty(dummy_shape, dtype=torch.bfloat16, device=placeholder_device)
+                residual = None
+                is_moe_placeholder_mode = True
+        # NOTE: [split] For MoE rank, hidden_states is None after all layers
+        # (each layer sends result back to attn group). Skip final norm.
+        # Also skip if we created a placeholder tensor during warmup.
+        if self.is_split_moe_mode and (hidden_states is None or is_moe_placeholder_mode):
+            return None
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -464,6 +649,8 @@ class Qwen3MoeModel(nn.Module):
         # Return auxiliary hidden states if collected
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
+
+        # TODO: [split] moe-rank 负责返回最后结果(外部是怎么搞的?)
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
@@ -504,7 +691,48 @@ class Qwen3MoeModel(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         expert_params_mapping = self.get_expert_mapping()
+
+        # NOTE: Determine what weights to load based on split mode
+        load_attention = not self.is_split_moe_mode
+        load_moe = not self.is_split_attn_mode
+        if not(load_attention or load_moe):
+            load_attention = True
+            load_moe = True
+
         for name, loaded_weight in weights:
+            # NOTE: Skip attention weights in moe mode
+            if not load_attention and (
+                ".self_attn.q_proj" in name or
+                ".self_attn.k_proj" in name or
+                ".self_attn.v_proj" in name or
+                ".self_attn.o_proj" in name or
+                ".attn.q_proj" in name or
+                ".attn.k_proj" in name or
+                ".attn.v_proj" in name or
+                ".attn.o_proj" in name or
+                "qkv_proj" in name or
+                ".self_attn.k_norm" in name or
+                ".self_attn.q_norm" in name
+            ):
+                continue
+
+            # Skip MoE weights in attn mode
+            if not load_moe and (
+                ".mlp.experts." in name or
+                "experts.gate" in name or
+                "experts.up_proj" in name or
+                "experts.down_proj" in name or
+                ".mlp.gate." in name or
+                ".mlp.gate.weight" in name or
+                ".mlp.gate_up_proj" in name or
+                ".mlp.shared_experts." in name  # NOTE: shared_experts 属于 MoE 部分
+            ):
+                continue
+
+            # NOTE: [split] MoE mode不需要embed_tokens
+            if not load_attention and "embed_tokens" in name:
+                continue
+
             if self.quant_config is not None and (
                 scale_name := self.quant_config.get_cache_scale(name)
             ):
@@ -630,6 +858,15 @@ class Qwen3MoeModel(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        # NOTE: [split]
+        if not(load_moe and load_attention):
+            logger.info(
+                f"[Rank {torch.distributed.get_rank()}] Weight loading done: "
+                f"attention={load_attention}, moe={load_moe}, "
+                f"loaded_params={loaded_params}"
+            )
+
         return loaded_params
 
 
@@ -658,14 +895,28 @@ class Qwen3MoeForCausalLM(
         self.model = Qwen3MoeModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "lm_head"),
-        )
-        if self.config.tie_word_embeddings:
-            self.lm_head.weight = self.model.embed_tokens.weight
+
+        # NOTE: split模式下，MoE rank不初始化lm_head
+        parallel_config = vllm_config.parallel_config
+        is_split_moe_mode = False
+        if parallel_config.split_tp_size > 0 and parallel_config.split_ep_size > 0:
+            from vllm.distributed import is_split_moe_rank
+            is_split_moe_mode = is_split_moe_rank()
+
+        if not is_split_moe_mode:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
+
+            # TODO: 后续split_ep_group算完之后，把数据发回split_tp_group, 依然由split_tp_group来负责lm_head计算
+            if self.config.tie_word_embeddings:
+                self.lm_head.weight = self.model.embed_tokens.weight
+        else:
+            # TODO: moe_mode 不需要lm_head
+            self.lm_head = None
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
@@ -686,7 +937,14 @@ class Qwen3MoeForCausalLM(
                 self.moe_layers.append(layer.mlp.experts)
 
         if example_layer is None:
-            raise RuntimeError("No Qwen3MoE layer found in the model.layers.")
+            # NOTE: [split] early escape
+            if vllm_config.parallel_config.split_tp_size > 0:
+                self.num_moe_layers = len(self.moe_layers)
+                self.num_expert_groups = 1
+                self.num_shared_experts = 0
+                return
+            else:
+                raise RuntimeError("No Qwen3MoE layer found in the model.layers.")
 
         self.num_moe_layers = len(self.moe_layers)
         self.num_expert_groups = 1
@@ -740,10 +998,16 @@ class Qwen3MoeForCausalLM(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        # NOTE: [split] split模式下，MoE rank没有lm_head
+        if self.lm_head is None:
+            return None
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # NOTE: [split] MoE rank 没有 lm_head，需要过滤掉相关权重
+        if self.lm_head is None:
+            weights = [(n, w) for n, w in weights if not n.startswith("lm_head.")]
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
 

@@ -406,6 +406,11 @@ class EngineArgs:
     data_parallel_external_lb: bool = False
     data_parallel_backend: str = ParallelConfig.data_parallel_backend
     enable_expert_parallel: bool = ParallelConfig.enable_expert_parallel
+
+    # NOTE: [lqf]
+    split_tp_size: int = ParallelConfig.split_tp_size
+    split_ep_size: int = ParallelConfig.split_ep_size
+
     all2all_backend: str | None = ParallelConfig.all2all_backend
     enable_dbo: bool = ParallelConfig.enable_dbo
     dbo_decode_token_threshold: int = ParallelConfig.dbo_decode_token_threshold
@@ -837,6 +842,23 @@ class EngineArgs:
         parallel_group.add_argument(
             "--enable-expert-parallel", **parallel_kwargs["enable_expert_parallel"]
         )
+
+        # NOTE: lqf
+        parallel_group.add_argument(
+            "--split-tp-size",
+            type=int,
+            default=0,
+            help="Size of ATTN group for LQF attention/MoE split mode. "
+                 "Ranks [0, split_tp_size-1] load attention weights only.",
+        )
+        parallel_group.add_argument(
+            "--split-ep-size",
+            type=int,
+            default=0,
+            help="Size of MOE group for LQF attention/MoE split mode. "
+                 "Ranks [split_tp_size, world_size-1] load MoE weights only.",
+        )
+
         parallel_group.add_argument(
             "--all2all-backend", **parallel_kwargs["all2all_backend"]
         )
@@ -1555,6 +1577,9 @@ class EngineArgs:
             data_parallel_backend=self.data_parallel_backend,
             data_parallel_hybrid_lb=self.data_parallel_hybrid_lb,
             enable_expert_parallel=self.enable_expert_parallel,
+            # NOTE: [lqf]
+            split_tp_size=self.split_tp_size,
+            split_ep_size=self.split_ep_size,
             all2all_backend=self.all2all_backend,
             enable_dbo=self.enable_dbo,
             dbo_decode_token_threshold=self.dbo_decode_token_threshold,
