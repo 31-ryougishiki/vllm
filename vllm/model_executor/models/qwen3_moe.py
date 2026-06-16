@@ -501,6 +501,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
 class Qwen3MoeModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        logger.info("[DEBUG][Rank %d] Qwen3MoeModel.__init__: entered",
+                    torch.distributed.get_rank())
 
         config = vllm_config.model_config.hf_text_config
         quant_config = vllm_config.quant_config
@@ -525,11 +527,15 @@ class Qwen3MoeModel(nn.Module):
             self.is_split_attn_mode = is_split_attn_rank()
             self.is_split_moe_mode = is_split_moe_rank()
 
+            logger.info("[DEBUG][Rank %d] Qwen3MoeModel: before init_cross_group",
+                        torch.distributed.get_rank())
             # Initialize cross-group communication
             from vllm_ascend.distributed.split_attn_moe_communicator import (
                 init_cross_group,
             )
             init_cross_group(self.split_tp_size, self.split_ep_size)
+            logger.info("[DEBUG][Rank %d] Qwen3MoeModel: after init_cross_group",
+                        torch.distributed.get_rank())
 
             logger.info(
                 f"[Rank {torch.distributed.get_rank()}] Split attn-moe mode: "
