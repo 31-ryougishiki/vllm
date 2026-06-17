@@ -32,7 +32,6 @@ import torch
 from torch import nn
 
 from vllm.attention.layer import Attention
-
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_ep_group,
@@ -140,9 +139,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        _dbg_rank = torch.distributed.get_rank()
-        logger.info("[DEBUG][Rank %d] SparseMoeBlock.%s: entered",
-                    _dbg_rank, prefix)
 
         config = vllm_config.model_config.hf_text_config
         parallel_config = vllm_config.parallel_config
@@ -184,8 +180,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             self.physical_expert_start + self.n_local_physical_experts
         )
 
-        logger.info("[DEBUG][Rank %d] SparseMoeBlock.%s: before FusedMoE, ep_size=%d",
-                    _dbg_rank, prefix, self.ep_size)
         self.experts = FusedMoE(
             num_experts=self.n_routed_experts,
             top_k=config.num_experts_per_tok,
@@ -200,8 +194,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             is_sequence_parallel=self.is_sequence_parallel,
             routing_method_type=RoutingMethodType.Renormalize,
         )
-        logger.info("[DEBUG][Rank %d] SparseMoeBlock.%s: FusedMoE done",
-                    _dbg_rank, prefix)
 
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -210,8 +202,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.gate",
         )
-        logger.info("[DEBUG][Rank %d] SparseMoeBlock.%s: done",
-                    _dbg_rank, prefix)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert hidden_states.dim() <= 2, (
@@ -354,11 +344,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
         quant_config = vllm_config.quant_config
         parallel_config = vllm_config.parallel_config # NOTE: lqf
 
-        _dbg_rank = torch.distributed.get_rank()
-        _dbg_prefix = prefix
-        logger.info("[DEBUG][Rank %d] DecoderLayer.%s: entered",
-                    _dbg_rank, _dbg_prefix)
-
         self.hidden_size = config.hidden_size
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         dual_chunk_attention_config = getattr(
@@ -373,8 +358,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
             self.is_split_attn_mode = is_split_attn_rank()
             self.is_split_moe_mode = is_split_moe_rank()
         if self.is_split_attn_mode or (parallel_config.split_tp_size == 0):
-            logger.info("[DEBUG][Rank %d] DecoderLayer.%s: creating self_attn",
-                        _dbg_rank, _dbg_prefix)
             self.self_attn = Qwen3MoeAttention(
                 hidden_size=self.hidden_size,
                 num_heads=config.num_attention_heads,
@@ -401,8 +384,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
         # NOTE: mlp should be None only when using split mode AND current rank is attn rank
         # In normal mode (split_tp_size=0 or split_ep_size=0), mlp should always be created
-        logger.info("[DEBUG][Rank %d] DecoderLayer.%s: before mlp, layer_idx=%d",
-                    _dbg_rank, _dbg_prefix, layer_idx)
         if (parallel_config.split_tp_size > 0 and parallel_config.split_ep_size > 0
                 and not self.is_split_moe_mode):
             self.mlp = None
@@ -410,14 +391,10 @@ class Qwen3MoeDecoderLayer(nn.Module):
               if (layer_idx not in mlp_only_layers) and (
                   config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
               ):
-                  logger.info("[DEBUG][Rank %d] DecoderLayer.%s: creating SparseMoeBlock",
-                              _dbg_rank, _dbg_prefix)
                   self.mlp = Qwen3MoeSparseMoeBlock(
                       vllm_config=vllm_config, prefix=f"{prefix}.mlp"
                   )
               else:
-                  logger.info("[DEBUG][Rank %d] DecoderLayer.%s: creating Qwen3MoeMLP",
-                              _dbg_rank, _dbg_prefix)
                   self.mlp = Qwen3MoeMLP(
                       hidden_size=config.hidden_size,
                       intermediate_size=config.intermediate_size,
@@ -425,14 +402,10 @@ class Qwen3MoeDecoderLayer(nn.Module):
                       quant_config=quant_config,
                       prefix=f"{prefix}.mlp",
                   )
-        logger.info("[DEBUG][Rank %d] DecoderLayer.%s: mlp done, creating norms",
-                    _dbg_rank, _dbg_prefix)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        logger.info("[DEBUG][Rank %d] DecoderLayer.%s: done",
-                    _dbg_rank, _dbg_prefix)
 
     def forward(
         self,
@@ -526,8 +499,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
 class Qwen3MoeModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-        logger.info("[DEBUG][Rank %d] Qwen3MoeModel.__init__: entered",
-                    torch.distributed.get_rank())
 
         config = vllm_config.model_config.hf_text_config
         quant_config = vllm_config.quant_config
@@ -552,15 +523,11 @@ class Qwen3MoeModel(nn.Module):
             self.is_split_attn_mode = is_split_attn_rank()
             self.is_split_moe_mode = is_split_moe_rank()
 
-            logger.info("[DEBUG][Rank %d] Qwen3MoeModel: before init_cross_group",
-                        torch.distributed.get_rank())
             # Initialize cross-group communication
             from vllm_ascend.distributed.split_attn_moe_communicator import (
                 init_cross_group,
             )
             init_cross_group(self.split_tp_size, self.split_ep_size)
-            logger.info("[DEBUG][Rank %d] Qwen3MoeModel: after init_cross_group",
-                        torch.distributed.get_rank())
 
             logger.info(
                 f"[Rank {torch.distributed.get_rank()}] Split attn-moe mode: "
@@ -592,26 +559,18 @@ class Qwen3MoeModel(nn.Module):
             # (2026-04-15 fix - create dummy to avoid crash)
             self.embed_tokens = None
 
-        logger.info("[DEBUG][Rank %d] Qwen3MoeModel: before make_layers",
-                    torch.distributed.get_rank())
         import time as _time
         _rank = torch.distributed.get_rank()
         def _make_layer(prefix):
-            logger.info("[DEBUG][Rank %d] make_layers: creating %s",
-                        _rank, prefix)
             _t0 = _time.time()
             layer = Qwen3MoeDecoderLayer(vllm_config=vllm_config, prefix=prefix)
             _dt = _time.time() - _t0
-            logger.info("[DEBUG][Rank %d] make_layers: %s done in %.2fs",
-                        _rank, prefix, _dt)
             return layer
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             _make_layer,
             prefix=f"{prefix}.layers",
         )
-        logger.info("[DEBUG][Rank %d] Qwen3MoeModel: make_layers done (%d layers)",
-                    torch.distributed.get_rank(), len(self.layers))
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
@@ -928,13 +887,9 @@ class Qwen3MoeForCausalLM(
         # Only perform the following mapping when Qwen3MoeMLP exists
         if getattr(config, "mlp_only_layers", []):
             self.packed_modules_mapping["gate_up_proj"] = ["gate_proj", "up_proj"]
-        logger.info("[DEBUG][Rank %d] Qwen3MoeForCausalLM: before Qwen3MoeModel",
-                    torch.distributed.get_rank())
         self.model = Qwen3MoeModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
-        logger.info("[DEBUG][Rank %d] Qwen3MoeForCausalLM: after Qwen3MoeModel, before lm_head",
-                    torch.distributed.get_rank())
 
         # NOTE: split模式下，MoE rank不初始化lm_head
         parallel_config = vllm_config.parallel_config
@@ -962,8 +917,6 @@ class Qwen3MoeForCausalLM(
             self.model.make_empty_intermediate_tensors
         )
 
-        logger.info("[DEBUG][Rank %d] Qwen3MoeForCausalLM: before layer loop",
-                    torch.distributed.get_rank())
 
         # Set MoE hyperparameters
         self.expert_weights = []
@@ -979,8 +932,6 @@ class Qwen3MoeForCausalLM(
                 example_layer = layer.mlp
                 self.moe_layers.append(layer.mlp.experts)
 
-        logger.info("[DEBUG][Rank %d] Qwen3MoeForCausalLM: after layer loop, example_layer=%s",
-                    torch.distributed.get_rank(), example_layer is not None)
 
         if example_layer is None:
             # NOTE: [split] early escape
