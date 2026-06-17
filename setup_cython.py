@@ -37,13 +37,6 @@ elif is_linux:
 # Extension definitions
 # ---------------------------------------------------------------------------
 extensions = [
-    # Split-attn-moe: distributed group management (1938 lines, ~100 custom)
-    Extension(
-        "vllm.distributed.parallel_state_core",
-        sources=["vllm/distributed/parallel_state_core.pyx"],
-        extra_compile_args=extra_compile_args,
-        language="c++",
-    ),
     # Split-attn-moe: Qwen3MoE model with cross-group P2P (1061 lines, ~150 custom)
     Extension(
         "vllm.model_executor.models.qwen3_moe_core",
