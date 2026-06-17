@@ -32,7 +32,7 @@ import torch
 from torch import nn
 
 from vllm.attention.layer import Attention
-from vllm.compilation.decorators import support_torch_compile
+
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_ep_group,
@@ -523,7 +523,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-@support_torch_compile
 class Qwen3MoeModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
