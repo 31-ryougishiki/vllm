@@ -805,6 +805,8 @@ class FusedMoEParallelConfig:
     use_ep: bool  # whether to use EP or not
     all2all_backend: str  # all2all backend for MoE communication
 
+    split_ep_size: int = 0  # NOTE: lqf
+
     @property
     def use_all2all_kernels(self):
         return self.dp_size > 1 and self.use_ep
@@ -841,6 +843,7 @@ class FusedMoEParallelConfig:
         pcp_size_: int,
         dp_size_: int,
         vllm_parallel_config: ParallelConfig,
+        split_ep_size: int,
     ) -> "FusedMoEParallelConfig":
         """
         Determine MoE parallel configuration. Based on the input `tp_size_`,
@@ -959,6 +962,7 @@ class FusedMoEParallelConfig:
             ep_rank=ep_rank,
             use_ep=True,
             all2all_backend=vllm_parallel_config.all2all_backend,
+            split_ep_size=split_ep_size,
         )
 
 
@@ -1041,3 +1045,7 @@ class FusedMoEConfig:
             and has_flashinfer_cutlass_fused_moe()
             and envs.VLLM_FLASHINFER_MOE_BACKEND == "throughput"
         )
+
+    @property
+    def split_ep_size(self):
+        return self.moe_parallel_config.split_ep_size

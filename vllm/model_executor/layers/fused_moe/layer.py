@@ -103,6 +103,7 @@ def determine_expert_map(
     expert_placement_strategy: ExpertPlacementStrategy = "linear",
     num_fused_shared_experts: int = 0,
     return_expert_mask: bool = False,
+    split_ep_size: int = 0,  # NOTE:: lqf
 ) -> tuple[int, torch.Tensor | None, torch.Tensor | None]:
     """
     Calculates how many experts should be assigned to each rank for EP and
@@ -132,6 +133,10 @@ def determine_expert_map(
                 Returns None if ep_size is 1.
                 Used only when AITER MOE is enabled.
     """
+    # NOTE: lqf 如果指定了split_ep_size，使用它；否则使用全局ep_size
+    # 决定专家分配逻辑
+    ep_size = split_ep_size if split_ep_size > 0 else ep_size
+
     assert ep_size > 0
     if ep_size == 1:
         return (global_num_experts, None, None)
@@ -404,6 +409,7 @@ class FusedMoE(CustomOp):
             pcp_size_=pcp_size_,
             dp_size_=dp_size_,
             vllm_parallel_config=vllm_config.parallel_config,
+            split_ep_size=self.vllm_config.parallel_config.split_ep_size,
         )
 
         self.global_num_experts = num_experts + num_redundant_experts

@@ -23,6 +23,7 @@ If you only need to use the distributed environment without model/pipeline
  steps.
 """
 
+import os
 import contextlib
 import gc
 import pickle
@@ -1073,6 +1074,8 @@ _TP: GroupCoordinator | None = None
 
 
 def get_tp_group() -> GroupCoordinator:
+    if is_split_attn_enabled():
+        return get_split_attn_group()
     assert _TP is not None, "tensor model parallel group is not initialized"
     return _TP
 
@@ -1108,8 +1111,135 @@ _EP: GroupCoordinator | None = None
 
 
 def get_ep_group() -> GroupCoordinator:
+    # NOTE: split模式下使用split_moe_group
+    if is_split_attn_enabled():
+        return get_split_moe_group()
     assert _EP is not None, "expert parallel group is not initialized"
     return _EP
+
+
+# Custom group for split attention/MoE mode
+# Ranks [0, split_tp_size-1]: ATTN group
+# Ranks [split_tp_size, world_size-1]: MOE group
+_SPLIT_ATTN_GROUP: GroupCoordinator | None = None
+_SPLIT_MOE_GROUP: GroupCoordinator | None = None
+
+
+def init_split_attn_moe_group(split_tp_size: int, split_ep_size: int) -> None:
+  """Initialize split groups for attention/MoE separation.
+
+  Creates two groups:
+  - Ranks [0, split_tp_size-1]: ATTN group for attention weight loading
+  - Ranks [split_tp_size, world_size-1]: MOE group for MoE weight loading
+  """
+  global _SPLIT_ATTN_GROUP, _SPLIT_MOE_GROUP
+
+  rank = torch.distributed.get_rank()
+  world_size = torch.distributed.get_world_size()
+  backend = torch.distributed.get_backend(get_world_group().device_group)
+
+  if _SPLIT_ATTN_GROUP is not None or _SPLIT_MOE_GROUP is not None:
+      print(f"init_split_attn_moe_group directly return, rank={rank}", flush=True)
+      return  # Already initialized
+
+  # NOTE: This implementation does not support data parallelism
+  attn_ranks = list(range(split_tp_size))
+  moe_ranks = list(range(split_tp_size, world_size))
+
+  # NOTE: All processes must participate in new_group call, otherwise deadlock occurs
+  # Pass two groups to ensure each process is in at least one group (to avoid assert failure)
+  # But only the group it belongs to will be saved
+  attn_group = init_model_parallel_group(
+      [attn_ranks, moe_ranks],  # Pass two groups, ensure each process is in at least one
+      get_world_group().local_rank,
+      backend,
+      group_name="split_attn",
+  )
+
+  # MoE group needs to be created separately since the above call only initializes ATTN group
+  # Also pass two groups to avoid deadlock and assert
+  moe_group = init_model_parallel_group(
+      [attn_ranks, moe_ranks],
+      get_world_group().local_rank,
+      backend,
+      group_name="split_moe",
+  )
+
+  # Print final log based on rank ownership
+  if rank in attn_ranks:
+      _SPLIT_ATTN_GROUP = attn_group
+  else:
+      _SPLIT_MOE_GROUP = moe_group
+
+  logger.info_once(
+      "Split attn-moe group initialized: rank %s, attn_ranks=%s, moe_ranks=%s",
+      rank, tuple(attn_ranks), tuple(moe_ranks),
+  )
+  if rank in attn_ranks:
+    logger.info_once(
+        "Split attn-moe group initialized: rank %s, local-rank=%s, attn_ranks=%s",
+        rank, _SPLIT_ATTN_GROUP.local_rank, _SPLIT_ATTN_GROUP.rank_in_group,
+    )
+  else:
+    logger.info_once(
+        "Split attn-moe group initialized: rank %s, local-rank=%s, moe_ranks=%s",
+        rank, _SPLIT_MOE_GROUP.local_rank, _SPLIT_MOE_GROUP.rank_in_group,
+    )
+
+
+def get_split_attn_group() -> GroupCoordinator | None:
+  return _SPLIT_ATTN_GROUP
+
+
+def get_split_moe_group() -> GroupCoordinator | None:
+  return _SPLIT_MOE_GROUP
+
+
+def is_split_attn_rank() -> bool:
+  if not torch.distributed.is_initialized():
+      print("is_split_attn_rank called, not initialized")
+      return False
+  from vllm.config import get_current_vllm_config
+  config = get_current_vllm_config()
+  if config is None:
+      print("is_split_attn_rank called, configg None")
+      return False
+  rank = torch.distributed.get_rank()
+  split_tp_size = config.parallel_config.split_tp_size
+  return rank < split_tp_size
+
+
+def is_split_moe_rank() -> bool:
+  if not torch.distributed.is_initialized():
+      return False
+  from vllm.config import get_current_vllm_config
+  config = get_current_vllm_config()
+  if config is None:
+      return False
+  rank = torch.distributed.get_rank()
+  split_tp_size = config.parallel_config.split_tp_size
+  return rank >= split_tp_size
+
+
+def get_split_group_info() -> tuple[int, int, int]:
+  """Get split group info: (group_type, rank_in_group, group_size)"""
+  from vllm.config import get_current_vllm_config
+  config = get_current_vllm_config()
+  rank = torch.distributed.get_rank()
+
+  if config is None:
+      return (0, 0, 1)
+
+  split_tp_size = config.parallel_config.split_tp_size
+  split_ep_size = config.parallel_config.split_ep_size
+
+  if rank < split_tp_size:
+      return (0, rank, split_tp_size)
+  else:
+      return (1, rank - split_tp_size, split_ep_size)
+
+def is_split_attn_enabled() -> bool:
+  return _SPLIT_ATTN_GROUP is not None or _SPLIT_MOE_GROUP is not None
 
 
 _PCP: GroupCoordinator | None = None
@@ -1305,11 +1435,16 @@ def initialize_model_parallel(
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
 
     data_parallel_size = 1
+    split_tp_size = 0
+    split_ep_size = 0
     from vllm.config import get_current_vllm_config
 
     config = get_current_vllm_config()
     if config is not None:
         data_parallel_size = config.parallel_config.data_parallel_size
+        split_tp_size = config.parallel_config.split_tp_size
+        split_ep_size = config.parallel_config.split_ep_size
+    logger.info_once(f"inside initialize_model_parallel: rank={rank}, split_tp_size={split_tp_size}, split_ep_size={split_ep_size}")
 
     # the layout order is: ExternalDP x DP x PP x TP
     # ExternalDP is the data parallel group that is not part of the model,
@@ -1329,19 +1464,22 @@ def initialize_model_parallel(
     )  # noqa
 
     # Build the tensor model-parallel groups.
+    # NOTE: split-mode下不初始化TP组，由split_attn_group替代
     global _TP
-    assert _TP is None, "tensor model parallel group is already initialized"
-    group_ranks = all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
-    group_ranks = [x.tolist() for x in group_ranks]
+    if not split_tp_size or split_tp_size == 0:
+        assert _TP is None, "tensor model parallel group is already initialized"
+        group_ranks = all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
+        group_ranks = [x.tolist() for x in group_ranks]
 
-    # message queue broadcaster is only used in tensor model parallel group
-    _TP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_message_queue_broadcaster=True,
-        group_name="tp",
-    )
+        # message queue broadcaster is only used in tensor model parallel group
+        _TP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_message_queue_broadcaster=True,
+            group_name="tp",
+        )
+    # else: split-mode下不初始化_TP，使用split_attn_group
 
     # Build the DCP model-parallel groups.
     global _DCP
@@ -1391,22 +1529,24 @@ def initialize_model_parallel(
         group_ranks, get_world_group().local_rank, backend, group_name="dp"
     )
 
+    # NOTE: [lqf] 原本的TP/EP组先去掉，通过报错信息来确定代码具体需要修改的范围
     global _EP
-    assert _EP is None, "expert parallel group is already initialized"
-    group_ranks = (
-        all_ranks.transpose(1, 2)
-        .reshape(
-            -1,
-            data_parallel_size
-            * prefill_context_model_parallel_size
-            * tensor_model_parallel_size,
+    if split_ep_size == 0:
+        assert _EP is None, "expert parallel group is already initialized"
+        group_ranks = (
+            all_ranks.transpose(1, 2)
+            .reshape(
+                -1,
+                data_parallel_size
+                * prefill_context_model_parallel_size
+                * tensor_model_parallel_size,
+            )
+            .unbind(0)
         )
-        .unbind(0)
-    )
-    group_ranks = [x.tolist() for x in group_ranks]
-    _EP = init_model_parallel_group(
-        group_ranks, get_world_group().local_rank, backend, group_name="ep"
-    )
+        group_ranks = [x.tolist() for x in group_ranks]
+        _EP = init_model_parallel_group(
+            group_ranks, get_world_group().local_rank, backend, group_name="ep"
+        )
 
     logger.info_once(
         "rank %s in world size %s is assigned as "
@@ -1417,9 +1557,21 @@ def initialize_model_parallel(
         _DP.rank_in_group,
         _PP.rank_in_group,
         _PCP.rank_in_group,
-        _TP.rank_in_group,
-        _EP.rank_in_group,
+        _TP.rank_in_group if _TP else None,
+        _EP.rank_in_group if _EP else None,
     )
+
+    # NOTE: Initialize split attn-moe groups if enabled
+    if split_tp_size > 0 and split_ep_size > 0:
+        init_split_attn_moe_group(split_tp_size, split_ep_size)
+        logger.info(
+            "rank %s in world size %s is assigned as "
+            "split-TP rank %s, split-MoE rank %s",
+            rank,
+            world_size,
+            _SPLIT_ATTN_GROUP.rank_in_group if _SPLIT_ATTN_GROUP else None,
+            _SPLIT_MOE_GROUP.rank_in_group if _SPLIT_MOE_GROUP else None,
+        )
 
 
 def ensure_model_parallel_initialized(
@@ -1517,11 +1669,23 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
 
 def get_tensor_model_parallel_world_size():
     """Return world size for the tensor model parallel group."""
+    # NOTE: split模式下使用split组的world_size
+    if is_split_attn_enabled():
+        if is_split_attn_rank():
+            return get_split_attn_group().world_size
+        else:
+            return get_split_moe_group().world_size
     return get_tp_group().world_size
 
 
 def get_tensor_model_parallel_rank():
     """Return my rank for the tensor model parallel group."""
+    # NOTE: split模式下使用split组的rank
+    if is_split_attn_enabled():
+        if is_split_attn_rank():
+            return get_split_attn_group().rank_in_group
+        else:
+            return get_split_moe_group().rank_in_group
     return get_tp_group().rank_in_group
 
 

@@ -115,6 +115,16 @@ class ParallelConfig:
     """Use expert parallelism instead of tensor parallelism for MoE layers."""
     enable_eplb: bool = False
     """Enable expert parallelism load balancing for MoE layers."""
+
+    split_tp_size: int = 0
+    """Size of ATTN group for LQF attention/MoE split mode.
+    Ranks [0, split_tp_size-1] will load attention weights only.
+    Must be set with split_ep_size."""
+    split_ep_size: int = 0
+    """Size of MOE group for LQF attention/MoE split mode.
+    Ranks [split_tp_size, world_size-1] will load MoE weights only.
+    Must be set with split_tp_size."""
+
     eplb_config: EPLBConfig = Field(default_factory=EPLBConfig)
     """Expert parallelism configuration."""
     expert_placement_strategy: ExpertPlacementStrategy = "linear"
@@ -501,9 +511,15 @@ class ParallelConfig:
                 )
 
         # Continue with the rest of the initialization
+        # If split_tp_size is set, use split_tp_size + split_ep_size as effective TP
+        if self.split_tp_size > 0:
+            effective_tp_size = self.split_tp_size + self.split_ep_size
+        else:
+            effective_tp_size = self.tensor_parallel_size
+
         self.world_size = (
             self.pipeline_parallel_size
-            * self.tensor_parallel_size
+            * effective_tp_size
             * self.prefill_context_parallel_size
         )
 
