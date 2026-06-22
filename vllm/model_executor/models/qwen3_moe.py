@@ -460,15 +460,27 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 recv_from_moe,
             )
             # Send to moe group (directly uses hidden_states)
+            if torch.distributed.get_rank() == 0:
+                logger.info("[SPLIT-COMM] rank=0 send_to_moe: hs=%s",
+                            tuple(hidden_states.shape))
             send_to_moe(hidden_states)
             # Receive from moe group directly into hidden_states
             hidden_states = recv_from_moe(hidden_states)
+            if torch.distributed.get_rank() == 0:
+                logger.info("[SPLIT-COMM] rank=0 recv_from_moe: hs=%s",
+                            tuple(hidden_states.shape))
 
             # [FIX] After recv_from_moe, need all_reduce to combine outputs from both moe ranks
             # In split mode, attn_rank 0 gets moe_rank 0 output, attn_rank 1 gets moe_rank 1 output
             # They need to be combined via all_reduce
             from vllm.distributed import tensor_model_parallel_all_reduce
+            if torch.distributed.get_rank() == 0:
+                logger.info("[SPLIT-COMM] rank=0 AR-moe_result enter: hs=%s",
+                            tuple(hidden_states.shape))
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+            if torch.distributed.get_rank() == 0:
+                logger.info("[SPLIT-COMM] rank=0 AR-moe_result done: hs=%s",
+                            tuple(hidden_states.shape))
         elif self.is_split_moe_mode and self.mlp is not None:
             # Moe group: recv from attn -> compute moe -> send to attn
             # NOTE: [split] Data received from attn has already been processed through
@@ -480,12 +492,18 @@ class Qwen3MoeDecoderLayer(nn.Module):
             )
             # Receive from attn group directly into hidden_states
             hidden_states = recv_from_attn(hidden_states)
+            if torch.distributed.get_rank() == 3:
+                logger.info("[SPLIT-COMM] rank=3 recv_from_attn: hs=%s",
+                            tuple(hidden_states.shape))
             # Skip post_attention_layernorm - data is already normalized
             # hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
             # Compute MoE
             hidden_states = self.mlp(hidden_states)
             # Send back to attn group
+            if torch.distributed.get_rank() == 3:
+                logger.info("[SPLIT-COMM] rank=3 send_to_attn: hs=%s",
+                            tuple(hidden_states.shape))
             send_to_attn(hidden_states)
 
             # Set hidden_states to None as result is already sent
