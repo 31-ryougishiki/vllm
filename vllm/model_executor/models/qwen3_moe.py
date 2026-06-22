@@ -66,6 +66,8 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.sequence import IntermediateTensors
 
+from vllm_ascend import moe_timer
+
 from .interfaces import MixtureOfExperts, SupportsEagle3, SupportsLoRA, SupportsPP
 from .utils import (
     AutoWeightsLoader,
@@ -213,33 +215,17 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         if self.is_sequence_parallel:
-            if torch.distributed.get_rank() == 0:
-                logger.info("[MOE-COMM] rank=0 SP-chunk enter: hs=%s",
-                            tuple(hidden_states.shape))
             hidden_states = sequence_parallel_chunk(hidden_states)
-            if torch.distributed.get_rank() == 0:
-                logger.info("[MOE-COMM] rank=0 SP-chunk done: hs=%s",
-                            tuple(hidden_states.shape))
-
-        # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
 
         if self.is_sequence_parallel:
-            if torch.distributed.get_rank() == 0:
-                logger.info("[MOE-COMM] rank=0 SP-all_gather enter: hs=%s",
-                            tuple(final_hidden_states.shape))
             final_hidden_states = tensor_model_parallel_all_gather(
                 final_hidden_states, 0
             )
             final_hidden_states = final_hidden_states[:num_tokens]
-            if torch.distributed.get_rank() == 0:
-                logger.info("[MOE-COMM] rank=0 SP-all_gather done: hs=%s",
-                            tuple(final_hidden_states.shape))
-
-        # return to 1d if input is 1d
         return final_hidden_states.squeeze(0) if is_input_1d else final_hidden_states
 
 
@@ -392,6 +378,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         # NOTE: Only create MoE module in MOE mode (or when not using split mode)
         # `mlp_only_layers` in the config.
         layer_idx = extract_layer_index(prefix)
+        self.layer_idx = layer_idx
         mlp_only_layers = (
             [] if not hasattr(config, "mlp_only_layers") else config.mlp_only_layers
         )
@@ -426,11 +413,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Self Attention
-        # NOTE: [split] For MoE rank, input_layernorm is not needed because
-        # the data received from attn group has already been processed through
-        # post_attention_layernorm. Skip input_layernorm to avoid computing on
-        # placeholder/dummy data.
+        moe_timer.layer_begin(self.layer_idx)
+
         if self.is_split_moe_mode:
             # MoE rank: skip input_layernorm, data will come from recv_from_attn
             if residual is None:
@@ -446,10 +430,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
         # NOTE: In split mode, handle cross-group communication
         if self.is_split_attn_mode and self.self_attn is not None:
             # Attn group: compute attention -> send to moe -> recv from moe
+            moe_timer.tick()
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
             )
+            moe_timer.tock("attn_total")
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
             )
@@ -459,28 +445,15 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 send_to_moe,
                 recv_from_moe,
             )
-            # Send to moe group (directly uses hidden_states)
-            if torch.distributed.get_rank() == 0:
-                logger.info("[SPLIT-COMM] rank=0 send_to_moe: hs=%s",
-                            tuple(hidden_states.shape))
+            moe_timer.tick()
             send_to_moe(hidden_states)
-            # Receive from moe group directly into hidden_states
             hidden_states = recv_from_moe(hidden_states)
-            if torch.distributed.get_rank() == 0:
-                logger.info("[SPLIT-COMM] rank=0 recv_from_moe: hs=%s",
-                            tuple(hidden_states.shape))
+            moe_timer.tock("p2p_send_recv")
 
-            # [FIX] After recv_from_moe, need all_reduce to combine outputs from both moe ranks
-            # In split mode, attn_rank 0 gets moe_rank 0 output, attn_rank 1 gets moe_rank 1 output
-            # They need to be combined via all_reduce
             from vllm.distributed import tensor_model_parallel_all_reduce
-            if torch.distributed.get_rank() == 0:
-                logger.info("[SPLIT-COMM] rank=0 AR-moe_result enter: hs=%s",
-                            tuple(hidden_states.shape))
+            moe_timer.tick()
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-            if torch.distributed.get_rank() == 0:
-                logger.info("[SPLIT-COMM] rank=0 AR-moe_result done: hs=%s",
-                            tuple(hidden_states.shape))
+            moe_timer.tock("p2p_allreduce")
         elif self.is_split_moe_mode and self.mlp is not None:
             # Moe group: recv from attn -> compute moe -> send to attn
             # NOTE: [split] Data received from attn has already been processed through
@@ -491,30 +464,29 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 send_to_attn,
             )
             # Receive from attn group directly into hidden_states
+            moe_timer.tick()
             hidden_states = recv_from_attn(hidden_states)
-            if torch.distributed.get_rank() == 3:
-                logger.info("[SPLIT-COMM] rank=3 recv_from_attn: hs=%s",
-                            tuple(hidden_states.shape))
-            # Skip post_attention_layernorm - data is already normalized
-            # hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+            moe_timer.tock("p2p_recv")
 
             # Compute MoE
             hidden_states = self.mlp(hidden_states)
+
             # Send back to attn group
-            if torch.distributed.get_rank() == 3:
-                logger.info("[SPLIT-COMM] rank=3 send_to_attn: hs=%s",
-                            tuple(hidden_states.shape))
+            moe_timer.tick()
             send_to_attn(hidden_states)
+            moe_timer.tock("p2p_send")
 
             # Set hidden_states to None as result is already sent
             hidden_states = None
         else:
             # Non-split mode: normal forward
             if self.self_attn is not None:
+                moe_timer.tick()
                 hidden_states = self.self_attn(
                     positions=positions,
                     hidden_states=hidden_states,
                 )
+                moe_timer.tock("attn_total")
 
             # Fully Connected
             hidden_states, residual = self.post_attention_layernorm(
@@ -522,7 +494,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
             )
 
             if self.mlp is not None:
+                moe_timer.tick()
                 hidden_states = self.mlp(hidden_states)
+                moe_timer.tock("moe_total")
 
         return hidden_states, residual
 
@@ -659,6 +633,7 @@ class Qwen3MoeModel(nn.Module):
         if self.is_split_moe_mode and hidden_states is not None:
             dummy_shape = hidden_states.shape
 
+        moe_timer.step_begin()
         aux_hidden_states = []
         for layer_idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
@@ -685,6 +660,8 @@ class Qwen3MoeModel(nn.Module):
                 hidden_states = torch.empty(dummy_shape, dtype=torch.bfloat16, device=placeholder_device)
                 residual = None
                 is_moe_placeholder_mode = True
+        moe_timer.dump()
+
         # NOTE: [split] For MoE rank, hidden_states is None after all layers
         # (each layer sends result back to attn group). Skip final norm.
         # Also skip if we created a placeholder tensor during warmup.
