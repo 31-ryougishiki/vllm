@@ -435,7 +435,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
             )
-            moe_timer.tock("attn_total")
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
             )
@@ -481,12 +480,10 @@ class Qwen3MoeDecoderLayer(nn.Module):
         else:
             # Non-split mode: normal forward
             if self.self_attn is not None:
-                moe_timer.tick()
                 hidden_states = self.self_attn(
                     positions=positions,
                     hidden_states=hidden_states,
                 )
-                moe_timer.tock("attn_total")
 
             # Fully Connected
             hidden_states, residual = self.post_attention_layernorm(
@@ -494,9 +491,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             )
 
             if self.mlp is not None:
-                moe_timer.tick()
                 hidden_states = self.mlp(hidden_states)
-                moe_timer.tock("moe_total")
 
         return hidden_states, residual
 
