@@ -213,7 +213,13 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         if self.is_sequence_parallel:
+            if torch.distributed.get_rank() == 0:
+                logger.info("[MOE-COMM] rank=0 SP-chunk enter: hs=%s",
+                            tuple(hidden_states.shape))
             hidden_states = sequence_parallel_chunk(hidden_states)
+            if torch.distributed.get_rank() == 0:
+                logger.info("[MOE-COMM] rank=0 SP-chunk done: hs=%s",
+                            tuple(hidden_states.shape))
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
@@ -222,10 +228,16 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         )
 
         if self.is_sequence_parallel:
+            if torch.distributed.get_rank() == 0:
+                logger.info("[MOE-COMM] rank=0 SP-all_gather enter: hs=%s",
+                            tuple(final_hidden_states.shape))
             final_hidden_states = tensor_model_parallel_all_gather(
                 final_hidden_states, 0
             )
             final_hidden_states = final_hidden_states[:num_tokens]
+            if torch.distributed.get_rank() == 0:
+                logger.info("[MOE-COMM] rank=0 SP-all_gather done: hs=%s",
+                            tuple(final_hidden_states.shape))
 
         # return to 1d if input is 1d
         return final_hidden_states.squeeze(0) if is_input_1d else final_hidden_states
