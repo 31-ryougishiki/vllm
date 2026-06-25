@@ -344,19 +344,31 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        _t0 = time.perf_counter()
         scheduler_output = self.scheduler.schedule()
+        _t1 = time.perf_counter()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with self.log_error_detail(scheduler_output):
             model_output = future.result()
+            _t2 = time.perf_counter()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+            _t3 = time.perf_counter()
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
+        )
+        _t4 = time.perf_counter()
+
+        logger.info(
+            "[Engine step] schedule=%.3f ms  execute_model_wait=%.3f ms  "
+            "sample=%.3f ms  update=%.3f ms",
+            (_t1 - _t0) * 1000, (_t2 - _t1) * 1000,
+            (_t3 - _t2) * 1000, (_t4 - _t3) * 1000,
         )
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
