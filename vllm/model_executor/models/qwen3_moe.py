@@ -674,8 +674,6 @@ class Qwen3MoeModel(nn.Module):
         # Do norm on attn rank, then P2P the norm'd result to its paired moe rank
         # so that all 4 ranks share lm_head vocabulary evenly.
         if self.is_split_attn_mode:
-            logger.info("[DBG] rank=%s attn: layer loop done, doing norm",
-                        torch.distributed.get_rank())
             if not get_pp_group().is_last_rank:
                 return IntermediateTensors(
                     {"hidden_states": hidden_states, "residual": residual}
@@ -690,11 +688,7 @@ class Qwen3MoeModel(nn.Module):
             local_rank = rank  # attn rank == local rank within attn group
             dst_rank = _CROSS_MOE_RANKS[local_rank]
             group = _CROSS_P2P_GROUPS[local_rank]
-            logger.info("[DBG] rank=%s attn: sending to rank=%s via group=%s",
-                        rank, dst_rank,
-                        dist.get_process_group_ranks(group) if group else None)
             dist.send(hidden_states.contiguous(), dst=dst_rank, group=group)
-            logger.info("[DBG] rank=%s attn: P2P send done", rank)
         elif self.is_split_moe_mode:
             # P2P recv norm'd hidden_states from paired attn rank
             import torch.distributed as dist
@@ -705,12 +699,6 @@ class Qwen3MoeModel(nn.Module):
             local_rank = rank - _CROSS_MOE_RANKS[0]
             src_rank = _CROSS_ATTN_RANKS[local_rank]
             group = _CROSS_P2P_GROUPS[local_rank]
-            logger.info("[DBG] rank=%s moe: recv from rank=%s via group=%s "
-                        "placeholder=%s shape=%s",
-                        rank, src_rank,
-                        dist.get_process_group_ranks(group) if group else None,
-                        is_moe_placeholder_mode,
-                        dummy_shape)
             if hidden_states is None or is_moe_placeholder_mode:
                 hidden_states = torch.empty(
                     dummy_shape, dtype=torch.bfloat16,
@@ -718,7 +706,6 @@ class Qwen3MoeModel(nn.Module):
                     torch.npu.current_device(),
                 )
             dist.recv(hidden_states, src=src_rank, group=group)
-            logger.info("[DBG] rank=%s moe: P2P recv done", rank)
 
         # Return auxiliary hidden states if collected
         if len(aux_hidden_states) > 0:
@@ -1059,20 +1046,13 @@ class Qwen3MoeForCausalLM(
             return None
         moe_timer.tick()
         if self.is_split_mode:
-            # In split mode, lm_head is sharded across all 4 ranks via MC2.
-            # Compute GEMM then allgather across the full MC2 group (4 ranks)
-            # instead of LogitsProcessor's tp_group (only 2 ranks).
-            logger.info("[DBG] rank=%s compute_logits: GEMM start",
-                        torch.distributed.get_rank())
+            # In split mode, lm_head is sharded across all 4 ranks via the
+            # dedicated split_lmhead group (attn + moe ranks).
             logits = self.lm_head.quant_method.apply(
                 self.lm_head, hidden_states)
-            logger.info("[DBG] rank=%s compute_logits: GEMM done, allgather start",
-                        torch.distributed.get_rank())
             from vllm_ascend.distributed.parallel_state import \
                 get_split_lmhead_group
             logits = get_split_lmhead_group().all_gather(logits, dim=-1)
-            logger.info("[DBG] rank=%s compute_logits: allgather done",
-                        torch.distributed.get_rank())
             if logits is not None:
                 logits = logits[..., :self.config.vocab_size]
         else:
