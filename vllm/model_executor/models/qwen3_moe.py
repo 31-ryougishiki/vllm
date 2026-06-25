@@ -1015,10 +1015,12 @@ class Qwen3MoeForCausalLM(
     ) -> torch.Tensor | None:
         # NOTE: [split] split模式下，MoE rank没有lm_head
         if self.lm_head is None:
+            moe_timer.dump()
             return None
         moe_timer.tick()
         logits = self.logits_processor(self.lm_head, hidden_states)
         moe_timer.tock_always("logits_processor")
+        moe_timer.dump()
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
