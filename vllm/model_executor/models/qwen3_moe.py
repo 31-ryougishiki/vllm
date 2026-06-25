@@ -604,12 +604,23 @@ class Qwen3MoeModel(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        # Determine num_tokens before embed for step-level tracking
+        if input_ids is not None:
+            _num_tokens = input_ids.shape[0]
+        elif inputs_embeds is not None:
+            _num_tokens = inputs_embeds.shape[0]
+        else:
+            _num_tokens = 0
+        moe_timer.step_begin(_num_tokens)
+
         # TODO: [split] 计算流程需要适配, moe-rank不进行embed计算
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
+                moe_timer.tick()
                 hidden_states = self.embed_input_ids(input_ids)
+                moe_timer.tock_always("embed")
             # NOTE: [split] In split mode (tp=2, ep=2), we need additional all_reduce
             # because VocabParallelEmbedding's internal all_reduce may not work correctly
             # when the two ranks have different token embeddings (each rank has partial vocab).
@@ -632,8 +643,6 @@ class Qwen3MoeModel(nn.Module):
         is_moe_placeholder_mode = False
         if self.is_split_moe_mode and hidden_states is not None:
             dummy_shape = hidden_states.shape
-
-        moe_timer.step_begin(hidden_states.shape[0] if hidden_states is not None else 0)
         aux_hidden_states = []
         for layer_idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
@@ -1007,7 +1016,9 @@ class Qwen3MoeForCausalLM(
         # NOTE: [split] split模式下，MoE rank没有lm_head
         if self.lm_head is None:
             return None
+        moe_timer.tick()
         logits = self.logits_processor(self.lm_head, hidden_states)
+        moe_timer.tock_always("lm_head")
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
