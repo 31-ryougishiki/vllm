@@ -1048,15 +1048,30 @@ class Qwen3MoeForCausalLM(
         if self.is_split_mode:
             # In split mode, lm_head is sharded across all 4 ranks via the
             # dedicated split_lmhead group (attn + moe ranks).
+            _t = time.perf_counter()
             logits = self.lm_head.quant_method.apply(
                 self.lm_head, hidden_states)
+            _t2 = time.perf_counter()
             from vllm_ascend.distributed.parallel_state import \
                 get_split_lmhead_group
             logits = get_split_lmhead_group().all_gather(logits, dim=-1)
+            _t3 = time.perf_counter()
+            logger.info(
+                "[LMHead] rank=%d gemm=%.3f ms allgather=%.3f ms shape=%s",
+                torch.distributed.get_rank(),
+                (_t2 - _t) * 1000, (_t3 - _t2) * 1000,
+                tuple(logits.shape) if logits is not None else None)
             if logits is not None:
                 logits = logits[..., :self.config.vocab_size]
         else:
+            _t = time.perf_counter()
             logits = self.logits_processor(self.lm_head, hidden_states)
+            _t2 = time.perf_counter()
+            logger.info(
+                "[LMHead] rank=%d logits_processor=%.3f ms shape=%s",
+                torch.distributed.get_rank(),
+                (_t2 - _t) * 1000,
+                tuple(logits.shape) if logits is not None else None)
         moe_timer.tock_always("logits_processor")
         moe_timer.dump()
         return logits
