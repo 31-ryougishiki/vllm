@@ -23,7 +23,6 @@
 # limitations under the License.
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
 
-import time
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -320,7 +319,7 @@ class Qwen3MoeAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        moe_timer.tick()
+        moe_timer.tick("attn_compute")
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
@@ -332,11 +331,11 @@ class Qwen3MoeAttention(nn.Module):
         if positions.numel() > 0 and q.shape[0] > 0:
             q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
-        moe_timer.tock_sync("attn_compute")
+        moe_timer.tock("attn_compute")
 
-        moe_timer.tick()
+        moe_timer.tick("attn_ar")
         output, _ = self.o_proj(attn_output)
-        moe_timer.tock_sync("attn_ar")
+        moe_timer.tock("attn_ar")
         return output
 
 
@@ -436,7 +435,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         # NOTE: In split mode, handle cross-group communication
         if self.is_split_attn_mode and self.self_attn is not None:
             # Attn group: compute attention -> send to moe -> recv from moe
-            moe_timer.tick()
+            moe_timer.tick("attn_full")
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -450,13 +449,13 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 send_to_moe,
                 recv_from_moe,
             )
-            moe_timer.tick()
+            moe_timer.tick("p2p_send_recv")
             send_to_moe(hidden_states)
             hidden_states = recv_from_moe(hidden_states)
             moe_timer.tock("p2p_send_recv")
 
             from vllm.distributed import tensor_model_parallel_all_reduce
-            moe_timer.tick()
+            moe_timer.tick("p2p_allreduce")
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
             moe_timer.tock("p2p_allreduce")
         elif self.is_split_moe_mode and self.mlp is not None:
@@ -469,7 +468,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 send_to_attn,
             )
             # Receive from attn group directly into hidden_states
-            moe_timer.tick()
+            moe_timer.tick("p2p_recv")
             hidden_states = recv_from_attn(hidden_states)
             moe_timer.tock("p2p_recv")
 
@@ -477,7 +476,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             hidden_states = self.mlp(hidden_states)
 
             # Send back to attn group
-            moe_timer.tick()
+            moe_timer.tick("p2p_send")
             send_to_attn(hidden_states)
             moe_timer.tock("p2p_send")
 
@@ -619,9 +618,9 @@ class Qwen3MoeModel(nn.Module):
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
-                moe_timer.tick()
+                moe_timer.tick("embed")
                 hidden_states = self.embed_input_ids(input_ids)
-                moe_timer.tock_always_sync("embed")
+                moe_timer.tock_always("embed")
             # NOTE: [split] In split mode (tp=2, ep=2), we need additional all_reduce
             # because VocabParallelEmbedding's internal all_reduce may not work correctly
             # when the two ranks have different token embeddings (each rank has partial vocab).
@@ -671,42 +670,16 @@ class Qwen3MoeModel(nn.Module):
                 residual = None
                 is_moe_placeholder_mode = True
 
-        # NOTE: [split] After all layers, attn rank has complete hidden_states.
-        # Do norm on attn rank, then P2P the norm'd result to its paired moe rank
-        # so that all 4 ranks share lm_head vocabulary evenly.
-        if self.is_split_attn_mode:
-            if not get_pp_group().is_last_rank:
-                return IntermediateTensors(
-                    {"hidden_states": hidden_states, "residual": residual}
-                )
-            hidden_states, _ = self.norm(hidden_states, residual)
-            # P2P send to paired moe rank (attn 0→moe 2, attn 1→moe 3)
-            import torch.distributed as dist
-            from vllm_ascend.distributed.split_attn_moe_communicator import (
-                _CROSS_P2P_GROUPS, _CROSS_MOE_RANKS,
+        # NOTE: [split] For MoE rank, hidden_states is None after all layers
+        # (each layer sends result back to attn group). Skip final norm.
+        if self.is_split_moe_mode and (hidden_states is None or is_moe_placeholder_mode):
+            return None
+
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors(
+                {"hidden_states": hidden_states, "residual": residual}
             )
-            rank = dist.get_rank()
-            local_rank = rank  # attn rank == local rank within attn group
-            dst_rank = _CROSS_MOE_RANKS[local_rank]
-            group = _CROSS_P2P_GROUPS[local_rank]
-            dist.send(hidden_states.contiguous(), dst=dst_rank, group=group)
-        elif self.is_split_moe_mode:
-            # P2P recv norm'd hidden_states from paired attn rank
-            import torch.distributed as dist
-            from vllm_ascend.distributed.split_attn_moe_communicator import (
-                _CROSS_ATTN_RANKS, _CROSS_MOE_RANKS, _CROSS_P2P_GROUPS,
-            )
-            rank = dist.get_rank()
-            local_rank = rank - _CROSS_MOE_RANKS[0]
-            src_rank = _CROSS_ATTN_RANKS[local_rank]
-            group = _CROSS_P2P_GROUPS[local_rank]
-            if hidden_states is None or is_moe_placeholder_mode:
-                hidden_states = torch.empty(
-                    dummy_shape, dtype=torch.bfloat16,
-                    device=input_ids.device if input_ids is not None else
-                    torch.npu.current_device(),
-                )
-            dist.recv(hidden_states, src=src_rank, group=group)
+        hidden_states, _ = self.norm(hidden_states, residual)
 
         # Return auxiliary hidden states if collected
         if len(aux_hidden_states) > 0:
@@ -933,32 +906,25 @@ class Qwen3MoeForCausalLM(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
 
-        # NOTE: In split mode, all ranks (both attn and moe) now participate
-        # in lm_head computation.  AscendVocabParallelEmbedding detects
-        # "head" in prefix and uses MC2 group (all 4 ranks) so that each
-        # rank gets vocab/4 = 37984 instead of vocab/2 = 75968.
-        self.is_split_mode = (
-            vllm_config.parallel_config.split_tp_size > 0 and
-            vllm_config.parallel_config.split_ep_size > 0
-        )
+        # NOTE: split模式下，MoE rank不初始化lm_head
+        parallel_config = vllm_config.parallel_config
         is_split_moe_mode = False
-        if self.is_split_mode:
+        if parallel_config.split_tp_size > 0 and parallel_config.split_ep_size > 0:
             from vllm.distributed import is_split_moe_rank
             is_split_moe_mode = is_split_moe_rank()
 
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "lm_head"),
-        )
+        if not is_split_moe_mode:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
 
-        if self.config.tie_word_embeddings:
-            if is_split_moe_mode:
-                # MoE rank doesn't have embed_tokens; skip weight tying
-                pass
-            else:
+            if self.config.tie_word_embeddings:
                 self.lm_head.weight = self.model.embed_tokens.weight
+        else:
+            self.lm_head = None
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
@@ -1042,58 +1008,20 @@ class Qwen3MoeForCausalLM(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-        if hidden_states is None:
+        # NOTE: [split] split模式下，MoE rank没有lm_head
+        if self.lm_head is None:
             moe_timer.dump()
             return None
-        moe_timer.tick()
-        if self.is_split_mode:
-            # In split mode, lm_head is sharded across all 4 ranks via the
-            # dedicated split_lmhead group (attn + moe ranks).
-            _t = time.perf_counter()
-            logits = self.lm_head.quant_method.apply(
-                self.lm_head, hidden_states)
-            _t2 = time.perf_counter()
-            # Sync to flush all forward-pass NPU work BEFORE allgather
-            torch.npu.synchronize()
-            _t2b = time.perf_counter()
-            from vllm_ascend.distributed.parallel_state import get_mc2_group
-            logits = get_mc2_group().all_gather(logits, dim=-1)
-            _t3 = time.perf_counter()
-            torch.npu.synchronize()
-            _t4 = time.perf_counter()
-            logger.info(
-                "[LMHead] rank=%d gemm=%.3f ms fwd_sync=%.3f ms "
-                "allgather_cpu=%.3f ms allgather_sync=%.3f ms shape=%s",
-                torch.distributed.get_rank(),
-                (_t2 - _t) * 1000, (_t2b - _t2) * 1000,
-                (_t3 - _t2b) * 1000, (_t4 - _t3) * 1000,
-                tuple(logits.shape) if logits is not None else None)
-            if logits is not None:
-                logits = logits[..., :self.config.vocab_size]
-        else:
-            # Measure pre-allgather shape for TP4 vs tp2ep2 comparison
-            _partial = self.lm_head.quant_method.apply(
-                self.lm_head, hidden_states)
-            _t0 = time.perf_counter()
-            logger.info(
-                "[LMHead] rank=%d pre_allgather_shape=%s",
-                torch.distributed.get_rank(), tuple(_partial.shape))
-            logits = self.logits_processor._gather_logits(_partial)
-            _t2 = time.perf_counter()
-            torch.npu.synchronize()
-            _t3 = time.perf_counter()
-            logger.info(
-                "[LMHead] rank=%d gather_cpu=%.3f ms sync=%.3f ms pre=%s post=%s",
-                torch.distributed.get_rank(),
-                (_t2 - _t0) * 1000,
-                (_t3 - _t2) * 1000,
-                tuple(_partial.shape),
-                tuple(logits.shape) if logits is not None else None)
-        moe_timer.tock_always_sync("logits_processor")
+        moe_timer.tick("logits_processor")
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        moe_timer.tock_always("logits_processor")
         moe_timer.dump()
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # NOTE: [split] MoE rank 没有 lm_head，需要过滤掉相关权重
+        if self.lm_head is None:
+            weights = [(n, w) for n, w in weights if not n.startswith("lm_head.")]
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
 
