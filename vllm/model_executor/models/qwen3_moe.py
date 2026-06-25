@@ -435,7 +435,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         # NOTE: In split mode, handle cross-group communication
         if self.is_split_attn_mode and self.self_attn is not None:
             # Attn group: compute attention -> send to moe -> recv from moe
-            moe_timer.tick("attn_full")
+            # (internal timing handled by nested attn_compute / attn_ar markers)
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -618,7 +618,7 @@ class Qwen3MoeModel(nn.Module):
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
-                moe_timer.tick("embed")
+                moe_timer.tick_always("embed")
                 hidden_states = self.embed_input_ids(input_ids)
                 moe_timer.tock_always("embed")
             # NOTE: [split] In split mode (tp=2, ep=2), we need additional all_reduce
@@ -1012,7 +1012,7 @@ class Qwen3MoeForCausalLM(
         if self.lm_head is None:
             moe_timer.dump()
             return None
-        moe_timer.tick("logits_processor")
+        moe_timer.tick_always("logits_processor")
         logits = self.logits_processor(self.lm_head, hidden_states)
         moe_timer.tock_always("logits_processor")
         moe_timer.dump()
