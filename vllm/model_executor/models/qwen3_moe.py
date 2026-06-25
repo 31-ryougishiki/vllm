@@ -669,11 +669,11 @@ class Qwen3MoeModel(nn.Module):
                 hidden_states = torch.empty(dummy_shape, dtype=torch.bfloat16, device=placeholder_device)
                 residual = None
                 is_moe_placeholder_mode = True
-        moe_timer.dump()
 
         # NOTE: [split] For MoE rank, hidden_states is None after all layers
         # (each layer sends result back to attn group). Skip final norm.
-        # Also skip if we created a placeholder tensor during warmup.
+        # dump() is deferred to compute_logits() which is called after forward()
+        # returns, so that lm_head timing can be included in the same step dump.
         if self.is_split_moe_mode and (hidden_states is None or is_moe_placeholder_mode):
             return None
 
@@ -1015,10 +1015,12 @@ class Qwen3MoeForCausalLM(
     ) -> torch.Tensor | None:
         # NOTE: [split] split模式下，MoE rank没有lm_head
         if self.lm_head is None:
+            moe_timer.dump()
             return None
         moe_timer.tick()
         logits = self.logits_processor(self.lm_head, hidden_states)
-        moe_timer.tock_always("lm_head")
+        moe_timer.tock_always("logits_processor")
+        moe_timer.dump()
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
