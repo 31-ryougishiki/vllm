@@ -693,10 +693,10 @@ class Qwen3MoeModel(nn.Module):
             # Receive norm'd hidden_states from paired attn rank
             import torch.distributed as dist
             from vllm_ascend.distributed.split_attn_moe_communicator import (
-                _CROSS_ATTN_RANKS, _CROSS_P2P_GROUPS,
+                _CROSS_ATTN_RANKS, _CROSS_MOE_RANKS, _CROSS_P2P_GROUPS,
             )
             rank = dist.get_rank()
-            local_rank = rank - _CROSS_ATTN_RANKS[0]
+            local_rank = rank - _CROSS_MOE_RANKS[0]
             src_rank = _CROSS_ATTN_RANKS[local_rank]
             group = _CROSS_P2P_GROUPS[local_rank]
             if hidden_states is None or is_moe_placeholder_mode:
@@ -1052,8 +1052,9 @@ class Qwen3MoeForCausalLM(
             # instead of LogitsProcessor's tp_group (only 2 ranks).
             logits = self.lm_head.quant_method.apply(
                 self.lm_head, hidden_states)
-            from vllm_ascend.distributed.parallel_state import get_mc2_group
-            logits = get_mc2_group().all_gather(logits, dim=-1)
+            from vllm_ascend.distributed.parallel_state import \
+                get_split_lmhead_group
+            logits = get_split_lmhead_group().all_gather(logits, dim=-1)
             if logits is not None:
                 logits = logits[..., :self.config.vocab_size]
         else:
