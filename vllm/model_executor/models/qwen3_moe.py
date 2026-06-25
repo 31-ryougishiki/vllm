@@ -23,6 +23,7 @@
 # limitations under the License.
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
 
+import time
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
