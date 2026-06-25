@@ -633,7 +633,7 @@ class Qwen3MoeModel(nn.Module):
         if self.is_split_moe_mode and hidden_states is not None:
             dummy_shape = hidden_states.shape
 
-        moe_timer.step_begin()
+        moe_timer.step_begin(hidden_states.shape[0] if hidden_states is not None else 0)
         aux_hidden_states = []
         for layer_idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
