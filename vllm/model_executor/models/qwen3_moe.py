@@ -1055,6 +1055,13 @@ class Qwen3MoeForCausalLM(
             _t2 = time.perf_counter()
             from vllm_ascend.distributed.parallel_state import \
                 get_split_lmhead_group
+            logger.info(
+                "[LMHead] rank=%d allgather_input_shape=%s allgather_output_shape=%s",
+                torch.distributed.get_rank(),
+                tuple(logits.shape),
+                tuple(s * get_split_lmhead_group().world_size
+                      if i == logits.dim() - 1 else s
+                      for i, s in enumerate(logits.shape)))
             logits = get_split_lmhead_group().all_gather(logits, dim=-1)
             _t3 = time.perf_counter()
             logger.info(
@@ -1065,13 +1072,20 @@ class Qwen3MoeForCausalLM(
             if logits is not None:
                 logits = logits[..., :self.config.vocab_size]
         else:
-            _t = time.perf_counter()
-            logits = self.logits_processor(self.lm_head, hidden_states)
+            # Measure pre-allgather shape for TP4 vs tp2ep2 comparison
+            _partial = self.lm_head.quant_method.apply(
+                self.lm_head, hidden_states)
+            _t0 = time.perf_counter()
+            logger.info(
+                "[LMHead] rank=%d pre_allgather_shape=%s",
+                torch.distributed.get_rank(), tuple(_partial.shape))
+            logits = self.logits_processor._gather_logits(_partial)
             _t2 = time.perf_counter()
             logger.info(
-                "[LMHead] rank=%d logits_processor=%.3f ms shape=%s",
+                "[LMHead] rank=%d gather=%.3f ms pre=%s post=%s",
                 torch.distributed.get_rank(),
-                (_t2 - _t) * 1000,
+                (_t2 - _t0) * 1000,
+                tuple(_partial.shape),
                 tuple(logits.shape) if logits is not None else None)
         moe_timer.tock_always("logits_processor")
         moe_timer.dump()
