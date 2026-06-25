@@ -670,24 +670,48 @@ class Qwen3MoeModel(nn.Module):
                 residual = None
                 is_moe_placeholder_mode = True
 
-        # NOTE: [split] For MoE rank, hidden_states is None after all layers
-        # (each layer sends result back to attn group). Skip final norm.
-        # dump() is deferred to compute_logits() which is called after forward()
-        # returns, so that lm_head timing can be included in the same step dump.
-        if self.is_split_moe_mode and (hidden_states is None or is_moe_placeholder_mode):
-            return None
-
-        if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
+        # NOTE: [split] After all layers, attn rank has complete hidden_states.
+        # Do norm on attn rank, then send the norm'd result to moe rank so that
+        # all 4 ranks can participate in lm_head (vocab split across 4 instead of 2).
+        if self.is_split_attn_mode:
+            if not get_pp_group().is_last_rank:
+                return IntermediateTensors(
+                    {"hidden_states": hidden_states, "residual": residual}
+                )
+            hidden_states, _ = self.norm(hidden_states, residual)
+            # Send norm'd hidden_states to paired moe rank via existing P2P group
+            import torch.distributed as dist
+            from vllm_ascend.distributed.split_attn_moe_communicator import (
+                _CROSS_P2P_GROUPS, _CROSS_MOE_RANKS,
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
+            rank = dist.get_rank()
+            local_rank = rank  # attn rank == local rank within attn group
+            dst_rank = _CROSS_MOE_RANKS[local_rank]
+            group = _CROSS_P2P_GROUPS[local_rank]
+            dist.send(hidden_states.contiguous(), dst=dst_rank, group=group)
+        elif self.is_split_moe_mode:
+            # Receive norm'd hidden_states from paired attn rank
+            import torch.distributed as dist
+            from vllm_ascend.distributed.split_attn_moe_communicator import (
+                _CROSS_ATTN_RANKS, _CROSS_P2P_GROUPS,
+            )
+            rank = dist.get_rank()
+            local_rank = rank - _CROSS_ATTN_RANKS[0]
+            src_rank = _CROSS_ATTN_RANKS[local_rank]
+            group = _CROSS_P2P_GROUPS[local_rank]
+            if hidden_states is None or is_moe_placeholder_mode:
+                hidden_states = torch.empty(
+                    dummy_shape, dtype=torch.bfloat16,
+                    device=input_ids.device if input_ids is not None else
+                    torch.npu.current_device(),
+                )
+            dist.recv(hidden_states, src=src_rank, group=group)
+            # MoE rank uses the received norm'd hidden_states directly below
 
         # Return auxiliary hidden states if collected
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
 
-        # TODO: [split] moe-rank 负责返回最后结果(外部是怎么搞的?)
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
@@ -909,27 +933,56 @@ class Qwen3MoeForCausalLM(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
 
-        # NOTE: split模式下，MoE rank不初始化lm_head
-        parallel_config = vllm_config.parallel_config
+        # NOTE: In split mode, all ranks (both attn and moe) now participate
+        # in lm_head computation.  Monkey-patch tp_size/tp_rank to use the
+        # MC2 group (all 4 ranks) so that each rank gets vocab/4 = 37984
+        # instead of vocab/2 = 75968.
+        self.is_split_mode = (
+            vllm_config.parallel_config.split_tp_size > 0 and
+            vllm_config.parallel_config.split_ep_size > 0
+        )
         is_split_moe_mode = False
-        if parallel_config.split_tp_size > 0 and parallel_config.split_ep_size > 0:
+        _tp_patch = None
+        if self.is_split_mode:
             from vllm.distributed import is_split_moe_rank
             is_split_moe_mode = is_split_moe_rank()
 
-        if not is_split_moe_mode:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "lm_head"),
-            )
+            from vllm_ascend.distributed.parallel_state import get_mc2_group
+            mc2_group = get_mc2_group()
+            _mc2_world_size = mc2_group.world_size
+            _mc2_rank_in_group = mc2_group.rank_in_group
+            import vllm.distributed.parallel_state as _ps
 
-            # TODO: 后续split_ep_group算完之后，把数据发回split_tp_group, 依然由split_tp_group来负责lm_head计算
-            if self.config.tie_word_embeddings:
+            _orig_tp_world_size = _ps.get_tensor_model_parallel_world_size
+            _orig_tp_rank = _ps.get_tensor_model_parallel_rank
+
+            def _patched_tp_world_size():
+                return _mc2_world_size
+
+            def _patched_tp_rank():
+                return _mc2_rank_in_group
+
+            _ps.get_tensor_model_parallel_world_size = _patched_tp_world_size
+            _ps.get_tensor_model_parallel_rank = _patched_tp_rank
+            _tp_patch = (_orig_tp_world_size, _orig_tp_rank)
+
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "lm_head"),
+        )
+
+        if _tp_patch is not None:
+            _ps.get_tensor_model_parallel_world_size = _tp_patch[0]
+            _ps.get_tensor_model_parallel_rank = _tp_patch[1]
+
+        if self.config.tie_word_embeddings:
+            if is_split_moe_mode:
+                # MoE rank doesn't have embed_tokens; skip weight tying
+                pass
+            else:
                 self.lm_head.weight = self.model.embed_tokens.weight
-        else:
-            # TODO: moe_mode 不需要lm_head
-            self.lm_head = None
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
@@ -1013,20 +1066,27 @@ class Qwen3MoeForCausalLM(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-        # NOTE: [split] split模式下，MoE rank没有lm_head
-        if self.lm_head is None:
+        if hidden_states is None:
             moe_timer.dump()
             return None
         moe_timer.tick()
-        logits = self.logits_processor(self.lm_head, hidden_states)
+        if self.is_split_mode:
+            # In split mode, lm_head is sharded across all 4 ranks via MC2.
+            # Compute GEMM then allgather across the full MC2 group (4 ranks)
+            # instead of LogitsProcessor's tp_group (only 2 ranks).
+            logits = self.lm_head.quant_method.apply(
+                self.lm_head, hidden_states)
+            from vllm_ascend.distributed.parallel_state import get_mc2_group
+            logits = get_mc2_group().all_gather(logits, dim=-1)
+            if logits is not None:
+                logits = logits[..., :self.config.vocab_size]
+        else:
+            logits = self.logits_processor(self.lm_head, hidden_states)
         moe_timer.tock_always("logits_processor")
         moe_timer.dump()
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # NOTE: [split] MoE rank 没有 lm_head，需要过滤掉相关权重
-        if self.lm_head is None:
-            weights = [(n, w) for n, w in weights if not n.startswith("lm_head.")]
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
 
