@@ -1720,13 +1720,10 @@ class FusedMoE(CustomOp):
                 and self.reduce_results
                 and (self.tp_size > 1 or self.ep_size > 1)
             ):
-                logger.info(
-                    "[MoE] reduce_output: tp_size=%s ep_size=%s dp_size=%s "
-                    "reduce_results=%s → calling maybe_all_reduce_tensor_model_parallel",
-                    self.tp_size, self.ep_size,
-                    getattr(self.moe_parallel_config, 'dp_size', '?'),
-                    self.reduce_results)
+                from vllm_ascend import moe_timer
+                moe_timer.tick()
                 states = self.maybe_all_reduce_tensor_model_parallel(states)
+                moe_timer.tock("moe_ar")
             return states
 
         if self.shared_experts is None:
