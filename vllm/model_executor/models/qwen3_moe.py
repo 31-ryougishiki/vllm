@@ -332,11 +332,11 @@ class Qwen3MoeAttention(nn.Module):
         if positions.numel() > 0 and q.shape[0] > 0:
             q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
-        moe_timer.tock("attn_compute")
+        moe_timer.tock_sync("attn_compute")
 
         moe_timer.tick()
         output, _ = self.o_proj(attn_output)
-        moe_timer.tock("attn_ar")
+        moe_timer.tock_sync("attn_ar")
         return output
 
 
@@ -621,7 +621,7 @@ class Qwen3MoeModel(nn.Module):
             else:
                 moe_timer.tick()
                 hidden_states = self.embed_input_ids(input_ids)
-                moe_timer.tock_always("embed")
+                moe_timer.tock_always_sync("embed")
             # NOTE: [split] In split mode (tp=2, ep=2), we need additional all_reduce
             # because VocabParallelEmbedding's internal all_reduce may not work correctly
             # when the two ranks have different token embeddings (each rank has partial vocab).
@@ -1053,25 +1053,20 @@ class Qwen3MoeForCausalLM(
             logits = self.lm_head.quant_method.apply(
                 self.lm_head, hidden_states)
             _t2 = time.perf_counter()
-            from vllm_ascend.distributed.parallel_state import \
-                get_split_lmhead_group
-            logger.info(
-                "[LMHead] rank=%d allgather_input_shape=%s allgather_output_shape=%s",
-                torch.distributed.get_rank(),
-                tuple(logits.shape),
-                tuple(s * get_split_lmhead_group().world_size
-                      if i == logits.dim() - 1 else s
-                      for i, s in enumerate(logits.shape)))
-            logits = get_split_lmhead_group().all_gather(logits, dim=-1)
+            # Sync to flush all forward-pass NPU work BEFORE allgather
+            torch.npu.synchronize()
+            _t2b = time.perf_counter()
+            from vllm_ascend.distributed.parallel_state import get_mc2_group
+            logits = get_mc2_group().all_gather(logits, dim=-1)
             _t3 = time.perf_counter()
             torch.npu.synchronize()
             _t4 = time.perf_counter()
             logger.info(
-                "[LMHead] rank=%d gemm=%.3f ms allgather_cpu=%.3f ms "
-                "allgather_npu_sync=%.3f ms shape=%s",
+                "[LMHead] rank=%d gemm=%.3f ms fwd_sync=%.3f ms "
+                "allgather_cpu=%.3f ms allgather_sync=%.3f ms shape=%s",
                 torch.distributed.get_rank(),
-                (_t2 - _t) * 1000, (_t3 - _t2) * 1000,
-                (_t4 - _t3) * 1000,
+                (_t2 - _t) * 1000, (_t2b - _t2) * 1000,
+                (_t3 - _t2b) * 1000, (_t4 - _t3) * 1000,
                 tuple(logits.shape) if logits is not None else None)
             if logits is not None:
                 logits = logits[..., :self.config.vocab_size]
@@ -1094,7 +1089,7 @@ class Qwen3MoeForCausalLM(
                 (_t3 - _t2) * 1000,
                 tuple(_partial.shape),
                 tuple(logits.shape) if logits is not None else None)
-        moe_timer.tock_always("logits_processor")
+        moe_timer.tock_always_sync("logits_processor")
         moe_timer.dump()
         return logits
 
