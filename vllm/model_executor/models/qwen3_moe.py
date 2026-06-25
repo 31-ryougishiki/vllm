@@ -934,37 +934,17 @@ class Qwen3MoeForCausalLM(
         )
 
         # NOTE: In split mode, all ranks (both attn and moe) now participate
-        # in lm_head computation.  Monkey-patch tp_size/tp_rank to use the
-        # MC2 group (all 4 ranks) so that each rank gets vocab/4 = 37984
-        # instead of vocab/2 = 75968.
+        # in lm_head computation.  AscendVocabParallelEmbedding detects
+        # "head" in prefix and uses MC2 group (all 4 ranks) so that each
+        # rank gets vocab/4 = 37984 instead of vocab/2 = 75968.
         self.is_split_mode = (
             vllm_config.parallel_config.split_tp_size > 0 and
             vllm_config.parallel_config.split_ep_size > 0
         )
         is_split_moe_mode = False
-        _tp_patch = None
         if self.is_split_mode:
             from vllm.distributed import is_split_moe_rank
             is_split_moe_mode = is_split_moe_rank()
-
-            from vllm_ascend.distributed.parallel_state import get_mc2_group
-            mc2_group = get_mc2_group()
-            _mc2_world_size = mc2_group.world_size
-            _mc2_rank_in_group = mc2_group.rank_in_group
-            import vllm.distributed.parallel_state as _ps
-
-            _orig_tp_world_size = _ps.get_tensor_model_parallel_world_size
-            _orig_tp_rank = _ps.get_tensor_model_parallel_rank
-
-            def _patched_tp_world_size():
-                return _mc2_world_size
-
-            def _patched_tp_rank():
-                return _mc2_rank_in_group
-
-            _ps.get_tensor_model_parallel_world_size = _patched_tp_world_size
-            _ps.get_tensor_model_parallel_rank = _patched_tp_rank
-            _tp_patch = (_orig_tp_world_size, _orig_tp_rank)
 
         self.lm_head = ParallelLMHead(
             config.vocab_size,
@@ -972,10 +952,6 @@ class Qwen3MoeForCausalLM(
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
-
-        if _tp_patch is not None:
-            _ps.get_tensor_model_parallel_world_size = _tp_patch[0]
-            _ps.get_tensor_model_parallel_rank = _tp_patch[1]
 
         if self.config.tie_word_embeddings:
             if is_split_moe_mode:
