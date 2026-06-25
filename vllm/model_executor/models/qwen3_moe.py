@@ -1064,10 +1064,14 @@ class Qwen3MoeForCausalLM(
                       for i, s in enumerate(logits.shape)))
             logits = get_split_lmhead_group().all_gather(logits, dim=-1)
             _t3 = time.perf_counter()
+            torch.npu.synchronize()
+            _t4 = time.perf_counter()
             logger.info(
-                "[LMHead] rank=%d gemm=%.3f ms allgather=%.3f ms shape=%s",
+                "[LMHead] rank=%d gemm=%.3f ms allgather_cpu=%.3f ms "
+                "allgather_npu_sync=%.3f ms shape=%s",
                 torch.distributed.get_rank(),
                 (_t2 - _t) * 1000, (_t3 - _t2) * 1000,
+                (_t4 - _t3) * 1000,
                 tuple(logits.shape) if logits is not None else None)
             if logits is not None:
                 logits = logits[..., :self.config.vocab_size]
@@ -1081,10 +1085,13 @@ class Qwen3MoeForCausalLM(
                 torch.distributed.get_rank(), tuple(_partial.shape))
             logits = self.logits_processor._gather_logits(_partial)
             _t2 = time.perf_counter()
+            torch.npu.synchronize()
+            _t3 = time.perf_counter()
             logger.info(
-                "[LMHead] rank=%d gather=%.3f ms pre=%s post=%s",
+                "[LMHead] rank=%d gather_cpu=%.3f ms sync=%.3f ms pre=%s post=%s",
                 torch.distributed.get_rank(),
                 (_t2 - _t0) * 1000,
+                (_t3 - _t2) * 1000,
                 tuple(_partial.shape),
                 tuple(logits.shape) if logits is not None else None)
         moe_timer.tock_always("logits_processor")
