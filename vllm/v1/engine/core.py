@@ -20,6 +20,27 @@ from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.envs import enable_envs_cache
 from vllm.logger import init_logger
+
+# Optional moe_timer import for breakgap profiling
+try:
+    from vllm_ascend import moe_timer as _moe_timer
+except ImportError:
+    _moe_timer = None
+
+
+def _timer_tick(seg: str):
+    if _moe_timer is not None:
+        _moe_timer.tick()
+
+
+def _timer_tock(seg: str):
+    if _moe_timer is not None:
+        _moe_timer.tock_always(seg)
+
+
+def _timer_dump():
+    if _moe_timer is not None:
+        _moe_timer.dump()
 from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -344,13 +365,17 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        _timer_tick("schedule")
         scheduler_output = self.scheduler.schedule()
+        _timer_tock("schedule")
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with self.log_error_detail(scheduler_output):
             model_output = future.result()
             if model_output is None:
+                _timer_tick("sample")
                 model_output = self.model_executor.sample_tokens(grammar_output)
+                _timer_tock("sample")
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -359,6 +384,7 @@ class EngineCore:
             scheduler_output, model_output
         )
 
+        _timer_dump()
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
     def post_step(self, model_executed: bool) -> None:
