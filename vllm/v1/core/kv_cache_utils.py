@@ -702,6 +702,17 @@ def _check_enough_kv_cache_memory(
 
     needed_memory = get_needed_memory()
 
+    logger.info(
+        "KV_CHECK_MEMORY: available_memory=%s (%s GiB) needed_memory=%s (%s GiB) "
+        "max_model_len=%s sufficient=%s",
+        available_memory,
+        format_gib(available_memory),
+        needed_memory,
+        format_gib(needed_memory),
+        max_model_len,
+        needed_memory <= available_memory,
+    )
+
     if needed_memory > available_memory:
         estimated_max_len = estimate_max_model_len(available_memory)
         estimated_msg = ""
@@ -729,7 +740,22 @@ def max_memory_usage_bytes(
     """
     Get the maximum memory usage in bytes for the given KV cache specs.
     """
-    return sum(spec.max_memory_usage_bytes(vllm_config) for spec in kv_cache_specs)
+    total = 0
+    for spec in kv_cache_specs:
+        spec_mem = spec.max_memory_usage_bytes(vllm_config)
+        logger.info(
+            "KV_MAX_MEM_PER_SPEC: type=%s block_size=%s page_size=%s "
+            "max_model_len=%s max_blocks=%s max_mem=%s",
+            type(spec).__name__,
+            spec.block_size,
+            spec.page_size_bytes if hasattr(spec, "page_size_bytes") else "N/A",
+            vllm_config.model_config.max_model_len,
+            cdiv(vllm_config.model_config.max_model_len, spec.block_size),
+            spec_mem,
+        )
+        total += spec_mem
+    logger.info("KV_MAX_MEM_TOTAL: total=%s (%s GiB)", total, format_gib(total))
+    return total
 
 
 def estimate_max_model_len(
@@ -1742,24 +1768,62 @@ def _max_memory_usage_bytes_from_groups(
     ):
         # Special case (only DeepseekV4 for now): all groups are
         # UniformTypeKVCacheSpecs.
-        # They must already be page_size aligned and share a common padded
-        # layer-tuple layout. Even groups with fewer actual tuples still reserve
-        # the global number of tuple slots in the shared tensor layout.
         full_mla_spec = cast(UniformTypeKVCacheSpecs, kv_cache_groups[0].kv_cache_spec)
-        layer_tuple_bytes = sum(full_mla_spec.get_page_sizes())
-        num_layer_tuples = max(
-            cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).get_num_layer_tuples()
-            for group in kv_cache_groups
+        page_sizes = full_mla_spec.get_page_sizes()
+        layer_tuple_bytes = sum(page_sizes)
+
+        # DEBUG: group-level num_layer_tuples
+        group_tuples = {}
+        for i, group in enumerate(kv_cache_groups):
+            group_spec = cast(UniformTypeKVCacheSpecs, group.kv_cache_spec)
+            nt = group_spec.get_num_layer_tuples()
+            group_tuples[i] = nt
+            logger.info(
+                "KV_NEEDED_MEM_GROUP_TUPLES: group_idx=%s num_layer_tuples=%s "
+                "num_layers=%s page_size_bytes=%s per_spec_page_sizes=%s",
+                i,
+                nt,
+                len(group.layer_names),
+                group_spec.page_size_bytes,
+                list(set(s.page_size_bytes for s in group_spec.kv_cache_specs.values())),
+            )
+
+        num_layer_tuples = max(group_tuples.values())
+
+        logger.info(
+            "KV_NEEDED_MEM_DSV4_BASE: page_sizes=%s layer_tuple_bytes=%s "
+            "num_layer_tuples=%s max_model_len=%s num_groups=%s",
+            page_sizes,
+            layer_tuple_bytes,
+            num_layer_tuples,
+            vllm_config.model_config.max_model_len,
+            len(kv_cache_groups),
         )
 
         total_max_mem_usage_bytes = 0
-        for group in kv_cache_groups:
+        for i, group in enumerate(kv_cache_groups):
             group_spec = cast(UniformTypeKVCacheSpecs, group.kv_cache_spec)
             g_max_mem_usage_pages = group_spec.max_memory_usage_pages(vllm_config)
             g_max_mem_usage_page_bytes = (
                 num_layer_tuples * g_max_mem_usage_pages * layer_tuple_bytes
             )
             total_max_mem_usage_bytes += g_max_mem_usage_page_bytes
+            logger.info(
+                "KV_NEEDED_MEM_DSV4_GROUP: group_idx=%s max_mem_usage_pages=%s "
+                "group_page_bytes=%s (%s GiB) running_total=%s (%s GiB)",
+                i,
+                g_max_mem_usage_pages,
+                g_max_mem_usage_page_bytes,
+                format_gib(g_max_mem_usage_page_bytes),
+                total_max_mem_usage_bytes,
+                format_gib(total_max_mem_usage_bytes),
+            )
+
+        logger.info(
+            "KV_NEEDED_MEM_DSV4_TOTAL: total=%s (%s GiB)",
+            total_max_mem_usage_bytes,
+            format_gib(total_max_mem_usage_bytes),
+        )
         return total_max_mem_usage_bytes
 
     # General case: group_size pools, each shared by one layer per group
