@@ -279,6 +279,27 @@ def _apply_alignment_padding(spec: MLAAttentionSpec | SlidingWindowMLASpec):
         return
     actual_page_size = spec.real_page_size_bytes
     padded_page_size = round_up(actual_page_size, spec.alignment)
+
+    compress_ratio = getattr(spec, "compress_ratio", None)
+    model_version = getattr(spec, "model_version", None)
+    cache_dtype_str = getattr(spec, "cache_dtype_str", None)
+    storage_block_size = getattr(spec, "storage_block_size", None)
+    logger.info(
+        "MLA_ALIGN: type=%s compress_ratio=%s model_version=%s "
+        "cache_dtype=%s block_size=%s storage_block_size=%s "
+        "real_page_size=%s alignment=%s padded_page_size=%s final=%s",
+        type(spec).__name__,
+        compress_ratio,
+        model_version,
+        cache_dtype_str,
+        spec.block_size,
+        storage_block_size,
+        actual_page_size,
+        spec.alignment,
+        padded_page_size,
+        padded_page_size if padded_page_size != actual_page_size else actual_page_size,
+    )
+
     if padded_page_size != actual_page_size:
         object.__setattr__(spec, "page_size_padded", padded_page_size)
 
@@ -332,16 +353,45 @@ class MLAAttentionSpec(FullAttentionSpec):
             if self.model_version == "deepseek_v4":
                 # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
                 # head_size stays semantic (512); bytes are determined here.
-                return self.storage_block_size * 584
+                result = self.storage_block_size * 584
+                logger.info(
+                    "MLA_REAL_PAGE_SIZE: type=MLAAttentionSpec formula=dsv4_584 "
+                    "compress_ratio=%s block_size=%s storage_block_size=%s "
+                    "584bytes_per_token=%s",
+                    self.compress_ratio,
+                    self.block_size,
+                    self.storage_block_size,
+                    result,
+                )
+                return result
             # V3.2 main MLA: 656-byte custom layout (kv_lora_rank=512 +
             # qk_rope_head_dim=64, head_size=576). See flashmla_sparse.py.
-            return self.block_size * 656
-        return (
+            result = self.block_size * 656
+            logger.info(
+                "MLA_REAL_PAGE_SIZE: type=MLAAttentionSpec formula=v32_656 "
+                "block_size=%s result=%s",
+                self.block_size,
+                result,
+            )
+            return result
+        result = (
             self.storage_block_size
             * self.num_kv_heads
             * self.head_size
             * get_dtype_size(self.dtype)
         )
+        logger.info(
+            "MLA_REAL_PAGE_SIZE: type=MLAAttentionSpec formula=generic "
+            "storage_block_size=%s num_kv_heads=%s head_size=%s dtype=%s "
+            "dtype_size=%s result=%s",
+            self.storage_block_size,
+            self.num_kv_heads,
+            self.head_size,
+            self.dtype,
+            get_dtype_size(self.dtype),
+            result,
+        )
+        return result
 
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
@@ -473,16 +523,38 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
     def real_page_size_bytes(self) -> int:
         if self.model_version == "deepseek_v4":
             # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
-            return self.storage_block_size * 584
+            result = self.storage_block_size * 584
+            logger.info(
+                "MLA_REAL_PAGE_SIZE: type=SlidingWindowMLASpec formula=dsv4_584 "
+                "compress_ratio=%s block_size=%s storage_block_size=%s "
+                "584bytes_per_token=%s",
+                self.compress_ratio,
+                self.block_size,
+                self.storage_block_size,
+                result,
+            )
+            return result
         assert self.model_version is None, (
             f"Unsupported model version: {self.model_version}"
         )
-        return (
+        result = (
             self.storage_block_size
             * self.num_kv_heads
             * self.head_size
             * get_dtype_size(self.dtype)
         )
+        logger.info(
+            "MLA_REAL_PAGE_SIZE: type=SlidingWindowMLASpec formula=generic "
+            "storage_block_size=%s num_kv_heads=%s head_size=%s dtype=%s "
+            "dtype_size=%s result=%s",
+            self.storage_block_size,
+            self.num_kv_heads,
+            self.head_size,
+            self.dtype,
+            get_dtype_size(self.dtype),
+            result,
+        )
+        return result
 
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:

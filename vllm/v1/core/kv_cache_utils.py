@@ -1712,6 +1712,44 @@ def _report_kv_cache_config(
         max_concurrency,
     )
 
+    # DEBUG: log per-group KV cache spec details
+    for i, group in enumerate(kv_cache_config.kv_cache_groups):
+        spec = group.kv_cache_spec
+        logger.info(
+            "KV_GROUP_REPORT: group_idx=%s spec_type=%s page_size_bytes=%s "
+            "block_size=%s num_layers=%s first_layers=%s "
+            "compress_ratio=%s storage_block_size=%s alignment=%s "
+            "page_size_padded=%s model_version=%s cache_dtype=%s "
+            "num_kv_heads=%s head_size=%s dtype=%s",
+            i,
+            type(spec).__name__,
+            spec.page_size_bytes if hasattr(spec, "page_size_bytes") else "N/A",
+            getattr(spec, "block_size", "N/A"),
+            len(group.layer_names),
+            group.layer_names[:3],
+            getattr(spec, "compress_ratio", "N/A"),
+            getattr(spec, "storage_block_size", "N/A"),
+            getattr(spec, "alignment", "N/A"),
+            getattr(spec, "page_size_padded", "N/A"),
+            getattr(spec, "model_version", "N/A"),
+            getattr(spec, "cache_dtype_str", "N/A"),
+            getattr(spec, "num_kv_heads", "N/A"),
+            getattr(spec, "head_size", "N/A"),
+            getattr(spec, "dtype", "N/A"),
+        )
+
+    # DEBUG: log pool info
+    logger.info(
+        "KV_POOL_REPORT: num_blocks=%s block_size_used_for_calc=%s "
+        "total_pool_bytes=%s max_model_len=%s",
+        kv_cache_config.num_blocks,
+        kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+        if kv_cache_config.kv_cache_groups
+        else "N/A",
+        sum(t.size for t in kv_cache_config.kv_cache_tensors),
+        max_model_len,
+    )
+
 
 def _max_memory_usage_bytes_from_groups(
     vllm_config: VllmConfig,
