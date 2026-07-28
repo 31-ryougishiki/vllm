@@ -102,14 +102,10 @@ def snapshot(
 class _Span:
     """Single node in the call tree.  Internal — not part of the public API."""
 
-<<<<<<< ours
     __slots__ = (
         "name", "start_us", "end_us", "children", "attrs",
         "_start_event", "_end_event",
     )
-=======
-    __slots__ = ("name", "start_us", "end_us", "children", "attrs")
->>>>>>> theirs
 
     def __init__(
         self,
@@ -122,11 +118,8 @@ class _Span:
         self.end_us: float = 0.0  # 0 = untimed
         self.children: list[_Span] = []
         self.attrs: dict[str, Any] = attrs or {}
-<<<<<<< ours
         self._start_event: Any = None  # torch.npu.Event when NPU timing
         self._end_event: Any = None
-=======
->>>>>>> theirs
 
     @property
     def is_timed(self) -> bool:
@@ -137,7 +130,6 @@ class _Span:
         return max(0.0, self.end_us - self.start_us)
 
 
-<<<<<<< ours
 # ---------------------------------------------------------------------------
 # Zero-overhead no-op span used when tracing is disabled.
 # Using a pre-allocated singleton avoids creating context-manager objects
@@ -167,8 +159,6 @@ class _NoopSpan:
 _NOOP_SPAN = _NoopSpan()
 
 
-=======
->>>>>>> theirs
 class CallStackTracer:
     """Lightweight tracer that records a tree of named spans.
 
@@ -186,6 +176,11 @@ class CallStackTracer:
         When ``True``, every span records wall-clock enter / exit timestamps.
         When ``False`` (default), spans record structure only (zero overhead
         from ``perf_counter`` calls).  Per-span override via ``timing=True``.
+    use_npu_timing:
+        When ``True``, use ``torch.npu.Event`` for GPU-side timing instead of
+        host wall-clock.  Requires ``torch_npu``.
+    step_interval:
+        Only record every N steps (1 = every step).  Step 1 is always recorded.
     """
 
     def __init__(
@@ -194,20 +189,14 @@ class CallStackTracer:
         enabled: bool = True,
         first_step_only: bool = True,
         enable_timing: bool = False,
-<<<<<<< ours
         use_npu_timing: bool = False,
         step_interval: int = 1,
-=======
->>>>>>> theirs
     ) -> None:
         self._enabled = enabled
         self._first_step_only = first_step_only
         self._enable_timing = enable_timing
-<<<<<<< ours
         self._use_npu_timing = use_npu_timing
         self._step_interval = step_interval
-=======
->>>>>>> theirs
         self._active: bool = False
         self._step_count: int = 0
         self._step_id: str = ""
@@ -264,7 +253,6 @@ class CallStackTracer:
                 self._active = False
                 return
             self._step_count += 1
-<<<<<<< ours
             # Sample: only record every step_interval steps
             # (step 1 is always recorded for the first-step log).
             if self._step_interval > 1:
@@ -284,12 +272,6 @@ class CallStackTracer:
             else:
                 self._t0_us = time.perf_counter_ns() / 1000.0
                 self._root = _Span(self._step_id, start_us=0.0)
-=======
-            self._step_id = step_id or f"step_{self._step_count}"
-            self._step_metadata = dict(metadata or {})
-            self._t0_us = time.perf_counter_ns() / 1000.0
-            self._root = _Span(self._step_id, start_us=0.0)
->>>>>>> theirs
             self._stack = [self._root]
             self._active = True
 
@@ -301,7 +283,6 @@ class CallStackTracer:
             while len(self._stack) > 1:
                 self._pop_span()
             if self._root is not None:
-<<<<<<< ours
                 if (
                     self._use_npu_timing
                     and self._root._start_event is not None
@@ -314,11 +295,6 @@ class CallStackTracer:
                     self._root.end_us = (
                         time.perf_counter_ns() / 1000.0 - self._t0_us
                     )
-=======
-                self._root.end_us = (
-                    time.perf_counter_ns() / 1000.0 - self._t0_us
-                )
->>>>>>> theirs
 
     def reset_first_step(self) -> None:
         """Reset the step counter so the next ``step_begin`` records again.
@@ -360,7 +336,6 @@ class CallStackTracer:
             return
 
         timed = self._enable_timing or timing
-<<<<<<< ours
         node = _Span(name, start_us=0.0, attrs=attrs if attrs else None)
 
         if timed:
@@ -373,12 +348,6 @@ class CallStackTracer:
                 node.start_us = (
                     time.perf_counter_ns() / 1000.0 - self._t0_us
                 )
-=======
-        # All timestamps are relative to step_begin's _t0_us so that
-        # Chrome Trace output and duration calculations are consistent.
-        _now_us = (time.perf_counter_ns() / 1000.0 - self._t0_us) if timed else 0.0
-        node = _Span(name, start_us=_now_us, attrs=attrs if attrs else None)
->>>>>>> theirs
 
         with self._lock:
             if self._stack:
@@ -388,7 +357,6 @@ class CallStackTracer:
         try:
             yield
         finally:
-<<<<<<< ours
             if timed:
                 if self._use_npu_timing:
                     node._end_event = self._create_npu_event()
@@ -398,11 +366,6 @@ class CallStackTracer:
                         time.perf_counter_ns() / 1000.0 - self._t0_us
                     )
             with self._lock:
-=======
-            _end_us = (time.perf_counter_ns() / 1000.0 - self._t0_us) if timed else 0.0
-            with self._lock:
-                node.end_us = _end_us
->>>>>>> theirs
                 self._stack.pop()
 
     def mark(self, name: str, **attrs: Any) -> None:
@@ -505,7 +468,6 @@ class CallStackTracer:
 
         return obj
 
-<<<<<<< ours
     def flatten_spans(self) -> dict[str, float]:
         """Walk the span tree and return a flat dict of ``path → duration_us``.
 
@@ -534,14 +496,11 @@ class CallStackTracer:
         for child in span.children:
             CallStackTracer._flatten_child(child, path, result)
 
-=======
->>>>>>> theirs
     # -- internals -----------------------------------------------------------
 
     def _pop_span(self) -> None:
         """Pop the innermost span, setting its end time."""
         s = self._stack.pop()
-<<<<<<< ours
         if self._use_npu_timing:
             return  # Events already recorded in span() finally block
         if s.start_us > 0:
@@ -585,11 +544,6 @@ class CallStackTracer:
         for child in span.children:
             CallStackTracer._compute_npu_durations(child)
 
-=======
-        if s.start_us > 0:
-            s.end_us = time.perf_counter_ns() / 1000.0 - self._t0_us
-
->>>>>>> theirs
     @staticmethod
     def _render_tree(
         span: _Span,
@@ -675,7 +629,6 @@ class CallStackTracer:
 
 
 # ---------------------------------------------------------------------------
-<<<<<<< ours
 # CallStackCollector — per-step accumulation with auto-flush to disk
 # ---------------------------------------------------------------------------
 
@@ -872,31 +825,23 @@ class CallStackCollector:
 
 
 # ---------------------------------------------------------------------------
-=======
->>>>>>> theirs
-# Module-level singleton
+# Module-level singletons
 # ---------------------------------------------------------------------------
 
 _tracer: CallStackTracer | None = None
 _tracer_lock: threading.Lock = threading.Lock()
 
-<<<<<<< ours
 _collector: CallStackCollector | None = None
 _collector_lock: threading.Lock = threading.Lock()
 
-=======
->>>>>>> theirs
 
 def get_tracer(
     *,
     enabled: bool = True,
     first_step_only: bool = True,
     enable_timing: bool = False,
-<<<<<<< ours
     use_npu_timing: bool = False,
     step_interval: int = 1,
-=======
->>>>>>> theirs
 ) -> CallStackTracer:
     """Return (or create) the module-level :class:`CallStackTracer` singleton.
 
@@ -912,16 +857,12 @@ def get_tracer(
                     enabled=enabled,
                     first_step_only=first_step_only,
                     enable_timing=enable_timing,
-<<<<<<< ours
                     use_npu_timing=use_npu_timing,
                     step_interval=step_interval,
-=======
->>>>>>> theirs
                 )
     return _tracer
 
 
-<<<<<<< ours
 def get_collector(
     output_dir: str = "",
     *,
@@ -945,8 +886,6 @@ def get_collector(
     return _collector
 
 
-=======
->>>>>>> theirs
 @contextlib.contextmanager
 def span(
     name: str,
