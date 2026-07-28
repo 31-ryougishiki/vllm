@@ -2145,6 +2145,12 @@ class EngineArgs:
             weight_transfer_config=self.weight_transfer_config,
             shutdown_timeout=self.shutdown_timeout,
         )
+        _cs_debug = self.additional_config.get("callstack_tracing")
+        if _cs_debug:
+            logger.info(">>> [CallStack] arg_utils: callstack_tracing found in additional_config: %s", _cs_debug)
+        else:
+            logger.info(">>> [CallStack] arg_utils: callstack_tracing NOT in additional_config (keys: %s)",
+                        list(self.additional_config.keys()))
 
         return config
 
