@@ -382,6 +382,13 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
+        # --- Scheduling trace: collect events, print only on success ---
+        _sched_trace: list[str] = []
+        _sched_trace.append(
+            f"budget={token_budget} running={len(self.running)} "
+            f"waiting={len(self.waiting)} skipped={len(self.skipped_waiting)}"
+        )
+
         self.kv_cache_manager.new_step_starts()
 
         # First, schedule the RUNNING requests.
@@ -554,6 +561,11 @@ class Scheduler(SchedulerInterface):
                     if self.ec_connector is not None:
                         self.ec_connector.update_state_after_alloc(request, i)
 
+        _sched_trace.append(
+            f"phase1_done: scheduled_running={len(scheduled_running_reqs)} "
+            f"remaining_budget={token_budget} preempted={len(preempted_reqs)}"
+        )
+
         # Record the LoRAs in scheduled_running_reqs
         scheduled_loras: set[int] = set()
         if self.lora_config:
@@ -692,6 +704,13 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens = min(num_new_tokens, token_budget)
                     assert num_new_tokens > 0
 
+                    _sched_trace.append(
+                        f"waiting_cand: req={request_id} "
+                        f"num_tokens={request.num_tokens} computed={num_computed_tokens} "
+                        f"num_new={num_new_tokens} budget_left={token_budget} "
+                        f"running_cnt={len(self.running)}/{self.max_num_running_reqs}"
+                    )
+
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:
                         (
@@ -751,6 +770,10 @@ class Scheduler(SchedulerInterface):
                         num_encoder_tokens=num_encoder_tokens,
                     )
                 ):
+                    _sched_trace.append(
+                        f"waiting_reject(full_kv_reserve): req={request_id} "
+                        f"num_new={num_new_tokens} running_cnt={len(self.running)}"
+                    )
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
                     break
@@ -768,7 +791,10 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
-
+                    _sched_trace.append(
+                        f"waiting_reject(kv_alloc_fail): req={request_id} "
+                        f"num_new={num_new_tokens} running_cnt={len(self.running)}"
+                    )
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
                     if request.has_encoder_inputs:
@@ -836,6 +862,11 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
+                _sched_trace.append(
+                    f"waiting_accept: req={request_id} "
+                    f"num_new={num_new_tokens} budget_left={token_budget} "
+                    f"running_cnt={len(self.running) + 1}"
+                )
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 # Encoder-related.
@@ -955,6 +986,15 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+
+        # --- Print scheduling trace on success ---
+        _sched_trace.append(
+            f"END: total_tokens={total_num_scheduled_tokens}/{self.max_num_scheduled_tokens} "
+            f"scheduled(new={len(scheduled_new_reqs)} resumed={len(scheduled_resumed_reqs)} "
+            f"running={len(scheduled_running_reqs)}) preempted={len(preempted_reqs)}"
+        )
+        logger.info("[Schedule] %s", " | ".join(_sched_trace))
+
         return scheduler_output
 
     def _build_kv_connector_meta(
