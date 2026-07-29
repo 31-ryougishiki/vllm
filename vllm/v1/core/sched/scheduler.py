@@ -951,6 +951,15 @@ class Scheduler(SchedulerInterface):
             else None
         )
 
+        # Generate a short marker to correlate scheduler ↔ model-runner logs.
+        _n_reqs = len(num_scheduled_tokens)
+        if _n_reqs > 0:
+            _ids = sorted(num_scheduled_tokens.keys())
+            _hash = abs(hash(frozenset(_ids))) % 0x10000
+            _step_marker = f"N{_n_reqs}T{total_num_scheduled_tokens}_{_hash:04x}"
+        else:
+            _step_marker = "N0T0_0000"
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -967,6 +976,7 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            step_marker=_step_marker,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -993,7 +1003,7 @@ class Scheduler(SchedulerInterface):
             f"scheduled(new={len(scheduled_new_reqs)} resumed={len(scheduled_resumed_reqs)} "
             f"running={len(scheduled_running_reqs)}) preempted={len(preempted_reqs)}"
         )
-        logger.info("[Schedule] %s", " | ".join(_sched_trace))
+        logger.info("[Schedule] [%s] %s", _step_marker, " | ".join(_sched_trace))
 
         return scheduler_output
 
