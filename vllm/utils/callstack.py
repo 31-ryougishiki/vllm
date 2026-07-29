@@ -112,10 +112,11 @@ class _Span:
         name: str,
         start_us: float = 0.0,
         attrs: dict[str, Any] | None = None,
+        end_us: float = 0.0,
     ) -> None:
         self.name = name
         self.start_us = start_us  # 0 = untimed
-        self.end_us: float = 0.0  # 0 = untimed
+        self.end_us: float = end_us  # 0 = untimed
         self.children: list[_Span] = []
         self.attrs: dict[str, Any] = attrs or {}
         self._start_event: Any = None  # torch.npu.Event when NPU timing
