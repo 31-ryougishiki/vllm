@@ -2128,18 +2128,26 @@ class EngineCoreActorMixin:
     def _set_cuda_visible_devices(
         self, vllm_config: VllmConfig, local_dp_rank: int, device_control_env_var: str
     ):
-        world_size = vllm_config.parallel_config.world_size
+        parallel_config = vllm_config.parallel_config
+        world_size = parallel_config.world_size
+        offset = None
+        if parallel_config.is_heterogeneous_tp:
+            offset = parallel_config.get_rank_offset_for_dp(local_dp_rank)
         # Set CUDA_VISIBLE_DEVICES or equivalent.
         try:
             value = get_device_indices(
-                device_control_env_var, local_dp_rank, world_size
+                device_control_env_var, local_dp_rank, world_size, offset=offset
             )
             os.environ[device_control_env_var] = value
         except IndexError as e:
+            actual_start = (
+                offset if offset is not None
+                else local_dp_rank * world_size
+            )
+            actual_end = actual_start + parallel_config.local_world_size
             raise Exception(
                 f"Error setting {device_control_env_var}: "
-                f"local range: [{local_dp_rank * world_size}, "
-                f"{(local_dp_rank + 1) * world_size}) "
+                f"local range: [{actual_start}, {actual_end}) "
                 f'base value: "{os.getenv(device_control_env_var)}"'
             ) from e
 

@@ -463,6 +463,9 @@ class EngineArgs:
     numa_bind_nodes: list[int] | None = ParallelConfig.numa_bind_nodes
     numa_bind_cpus: list[str] | None = ParallelConfig.numa_bind_cpus
     tensor_parallel_size: int = ParallelConfig.tensor_parallel_size
+    heterogeneous_dp_config: str | None = None
+    """JSON string for per-DP-rank heterogeneous TP config.
+    E.g. '[{"dp_rank":0,"tp_size":3,"tp_sharding_ratios":[2,1,1]},{"dp_rank":1,"tp_size":4}]'"""
     prefill_context_parallel_size: int = ParallelConfig.prefill_context_parallel_size
     decode_context_parallel_size: int = ParallelConfig.decode_context_parallel_size
     dcp_comm_backend: DCPCommBackend = ParallelConfig.dcp_comm_backend
@@ -973,6 +976,19 @@ class EngineArgs:
         )
         parallel_group.add_argument(
             "--tensor-parallel-size", "-tp", **parallel_kwargs["tensor_parallel_size"]
+        )
+        parallel_group.add_argument(
+            "--heterogeneous-dp-config",
+            type=str,
+            default=None,
+            help=(
+                "JSON config for per-DP-rank heterogeneous TP. "
+                "Mutually exclusive with uniform --tensor-parallel-size "
+                "for heterogeneous deployments. "
+                "Example: '[{\"dp_rank\":0,\"tp_size\":3,"
+                "\"tp_sharding_ratios\":[2,1,1]},"
+                "{\"dp_rank\":1,\"tp_size\":4}]'"
+            ),
         )
         parallel_group.add_argument(
             "--decode-context-parallel-size",
@@ -1959,9 +1975,21 @@ class EngineArgs:
             model_config.skip_tokenizer_init = True
             logger.info("Skipping tokenizer initialization for tokens-only mode.")
 
+        # Parse heterogeneous DP config from JSON string
+        heterogeneous_dp_config = None
+        if self.heterogeneous_dp_config is not None:
+            import json
+            from vllm.config.parallel import HeterogeneousDPConfig
+
+            raw = json.loads(self.heterogeneous_dp_config)
+            heterogeneous_dp_config = [
+                HeterogeneousDPConfig(**item) for item in raw
+            ]
+
         parallel_config = ParallelConfig(
             pipeline_parallel_size=self.pipeline_parallel_size,
             tensor_parallel_size=self.tensor_parallel_size,
+            heterogeneous_dp_config=heterogeneous_dp_config,
             prefill_context_parallel_size=self.prefill_context_parallel_size,
             data_parallel_size=self.data_parallel_size,
             data_parallel_rank=self.data_parallel_rank or 0,

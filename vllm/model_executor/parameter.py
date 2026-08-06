@@ -147,8 +147,23 @@ class _ColumnvLLMParameter(BasevLLMParameter):
 
     def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
         shard_size = self.data.shape[self.output_dim]
+        from vllm.distributed.utils import (
+            get_current_tp_sharding_ratios,
+            get_tp_partition_offset,
+        )
+
+        ratios = get_current_tp_sharding_ratios()
+        if ratios is not None:
+            start_idx = get_tp_partition_offset(
+                total_size=loaded_weight.shape[self.output_dim],
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                tp_sharding_ratios=ratios,
+            )
+        else:
+            start_idx = self.tp_rank * shard_size
         loaded_weight = loaded_weight.narrow(
-            self.output_dim, self.tp_rank * shard_size, shard_size
+            self.output_dim, start_idx, shard_size
         )
         assert self.data.shape == loaded_weight.shape
         self.data.copy_(loaded_weight)
@@ -169,8 +184,23 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         param_data = self.data
 
         param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
+        from vllm.distributed.utils import (
+            get_current_tp_sharding_ratios,
+            get_tp_partition_offset,
+        )
+
+        ratios = get_current_tp_sharding_ratios()
+        if ratios is not None:
+            start_idx = get_tp_partition_offset(
+                total_size=loaded_weight.shape[self.output_dim],
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                tp_sharding_ratios=ratios,
+            )
+        else:
+            start_idx = self.tp_rank * shard_size
         loaded_weight = loaded_weight.narrow(
-            self.output_dim, self.tp_rank * shard_size, shard_size
+            self.output_dim, start_idx, shard_size
         )
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
@@ -219,8 +249,23 @@ class RowvLLMParameter(BasevLLMParameter):
 
     def load_row_parallel_weight(self, loaded_weight: torch.Tensor):
         shard_size = self.data.shape[self.input_dim]
+        from vllm.distributed.utils import (
+            get_current_tp_sharding_ratios,
+            get_tp_partition_offset,
+        )
+
+        ratios = get_current_tp_sharding_ratios()
+        if ratios is not None:
+            start_idx = get_tp_partition_offset(
+                total_size=loaded_weight.shape[self.input_dim],
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                tp_sharding_ratios=ratios,
+            )
+        else:
+            start_idx = self.tp_rank * shard_size
         loaded_weight = loaded_weight.narrow(
-            self.input_dim, self.tp_rank * shard_size, shard_size
+            self.input_dim, start_idx, shard_size
         )
 
         if len(loaded_weight.shape) == 0:

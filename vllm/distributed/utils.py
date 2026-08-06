@@ -64,6 +64,60 @@ def divide(numerator, denominator):
     return numerator // denominator
 
 
+def get_tp_partition_size(
+    total_size: int,
+    tp_rank: int,
+    tp_size: int,
+    tp_sharding_ratios: list[int] | None = None,
+) -> int:
+    """Return the partition size for ``tp_rank`` when splitting ``total_size``
+    across ``tp_size`` ranks.
+
+    When ``tp_sharding_ratios`` is ``None``, the split is uniform (legacy
+    behaviour).  Otherwise ratios are interpreted as relative weights, e.g.
+    ``[2, 1, 1]`` means 50%/25%/25%.  Any remainder is assigned to the last
+    rank.
+    """
+    if tp_sharding_ratios is None:
+        return divide(total_size, tp_size)
+    total_ratio = sum(tp_sharding_ratios)
+    sizes = [total_size * r // total_ratio for r in tp_sharding_ratios]
+    # Assign remainder to the last rank
+    sizes[-1] += total_size - sum(sizes)
+    return sizes[tp_rank]
+
+
+def get_tp_partition_offset(
+    total_size: int,
+    tp_rank: int,
+    tp_size: int,
+    tp_sharding_ratios: list[int] | None = None,
+) -> int:
+    """Return the starting offset for ``tp_rank`` when splitting ``total_size``
+    across ``tp_size`` ranks (cumulative sum of preceding partition sizes).
+    """
+    if tp_sharding_ratios is None:
+        return tp_rank * divide(total_size, tp_size)
+    total_ratio = sum(tp_sharding_ratios)
+    offset = 0
+    for i in range(tp_rank):
+        offset += total_size * tp_sharding_ratios[i] // total_ratio
+    return offset
+
+
+def get_current_tp_sharding_ratios() -> list[int] | None:
+    """Return the ``tp_sharding_ratios`` for the current DP rank, or ``None``
+    if uniform sharding is being used."""
+    from vllm.config import get_current_vllm_config_or_none
+
+    cfg = get_current_vllm_config_or_none()
+    if cfg is None:
+        return None
+    return cfg.parallel_config.get_sharding_ratios_for_dp(
+        cfg.parallel_config.data_parallel_rank
+    )
+
+
 def is_weak_contiguous(inp: torch.Tensor) -> bool:
     """Check that *inp* occupies a single contiguous block of memory.
 

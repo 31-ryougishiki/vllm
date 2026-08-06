@@ -360,8 +360,19 @@ class DefaultModelLoader(BaseModelLoader):
         dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
         tp_rank = get_tensor_model_parallel_rank() if tp_size > 1 else 0
         pcp_rank = get_pcp_group().rank_in_group if pcp_size > 1 else 0
-        ep_size = dp_size * pcp_size * tp_size
-        ep_rank = dp_rank * pcp_size * tp_size + pcp_rank * tp_size + tp_rank
+        if parallel_config.is_heterogeneous_tp:
+            tp_sizes = [
+                parallel_config.get_tp_size_for_dp(i) for i in range(dp_size)
+            ]
+            ep_size = sum(tp_sizes) * pcp_size
+            ep_rank = (
+                sum(tp_sizes[i] * pcp_size for i in range(dp_rank))
+                + pcp_rank * tp_sizes[dp_rank]
+                + tp_rank
+            )
+        else:
+            ep_size = dp_size * pcp_size * tp_size
+            ep_rank = dp_rank * pcp_size * tp_size + pcp_rank * tp_size + tp_rank
 
         self.local_expert_ids = compute_local_expert_ids(
             num_experts,

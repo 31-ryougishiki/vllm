@@ -289,11 +289,17 @@ def set_device_control_env_var(
     Temporarily set CUDA_VISIBLE_DEVICES or equivalent
     for engine subprocess.
     """
-    world_size = vllm_config.parallel_config.world_size
-    local_world_size = vllm_config.parallel_config.local_world_size
+    parallel_config = vllm_config.parallel_config
+    world_size = parallel_config.world_size
+    local_world_size = parallel_config.local_world_size
     evar = current_platform.device_control_env_var
 
-    value = get_device_indices(evar, local_dp_rank, world_size, local_world_size)
+    offset = None
+    if parallel_config.is_heterogeneous_tp:
+        offset = parallel_config.get_rank_offset_for_dp(local_dp_rank)
+    value = get_device_indices(
+        evar, local_dp_rank, world_size, local_world_size, offset=offset
+    )
     with patch.dict(os.environ, values=((evar, value),)):
         yield
 
@@ -303,6 +309,7 @@ def get_device_indices(
     local_dp_rank: int,
     world_size: int,
     local_world_size: int | None = None,
+    offset: int | None = None,
 ):
     """
     Returns a comma-separated string of device indices for the specified
@@ -310,22 +317,24 @@ def get_device_indices(
 
     For example, if world_size=2 and local_dp_rank=1, and there are 4 devices,
     this will select devices 2 and 3 for local_dp_rank=1.
+
+    When ``offset`` is provided (for heterogeneous TP), it is used as the
+    starting device index instead of ``local_dp_rank * world_size``.
     """
     if local_world_size is None:
         local_world_size = world_size
+    if offset is None:
+        offset = local_dp_rank * world_size
     try:
         value = ",".join(
             str(current_platform.device_id_to_physical_device_id(i))
-            for i in range(
-                local_dp_rank * world_size,
-                local_dp_rank * world_size + local_world_size,
-            )
+            for i in range(offset, offset + local_world_size)
         )
     except IndexError as e:
         raise Exception(
             f"Error setting {device_control_env_var}: "
-            f"local range: [{local_dp_rank * world_size}, "
-            f"{(local_dp_rank + 1) * world_size}) "
+            f"local range: [{offset}, "
+            f"{offset + local_world_size}) "
             "base value: "
             f'"{os.getenv(device_control_env_var)}"'
         ) from e

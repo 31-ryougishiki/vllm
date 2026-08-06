@@ -1545,7 +1545,12 @@ def init_distributed_environment(
         parallel_config = config.parallel_config
         # adjust to take into account data parallelism
         # offset the rank by the data parallel rank
-        rank = parallel_config.data_parallel_rank * world_size + rank
+        if parallel_config.is_heterogeneous_tp:
+            rank = parallel_config.get_rank_offset_for_dp(
+                parallel_config.data_parallel_rank
+            ) + rank
+        else:
+            rank = parallel_config.data_parallel_rank * world_size + rank
         # adjust the world size to take into account data parallelism
         world_size = parallel_config.world_size_across_dp
 
@@ -1736,6 +1741,81 @@ def initialize_model_parallel(
         backend = backend or torch.distributed.get_backend(
             get_world_group().device_group
         )
+
+    if config is not None and config.parallel_config.is_heterogeneous_tp:
+        # Heterogeneous TP per DP rank: build groups from explicit rank lists
+        # instead of from a uniform 5D tensor reshape.
+        # Only supports PP=1, PCP=1 (enforced by config validation).
+        global _TP, _DP, _EP, _PP, _DCP, _PCP, _EPLB
+        assert _TP is None, "tensor model parallel group is already initialized"
+
+        local_rank = get_world_group().local_rank
+        backend = backend or torch.distributed.get_backend(
+            get_world_group().device_group
+        )
+        dp_size = data_parallel_size
+        tp_sizes = [
+            config.parallel_config.get_tp_size_for_dp(i)
+            for i in range(dp_size)
+        ]
+        min_tp = min(tp_sizes)
+        total_ranks = sum(tp_sizes)
+
+        # TP groups: each DP rank contributes one group
+        tp_groups = []
+        offset = 0
+        for i in range(dp_size):
+            tp_groups.append(list(range(offset, offset + tp_sizes[i])))
+            offset += tp_sizes[i]
+        _TP = init_model_parallel_group(
+            [list(map(int, g)) for g in tp_groups],
+            local_rank, backend,
+            use_message_queue_broadcaster=True, group_name="tp",
+        )
+
+        # DP groups: cross DP ranks at same TP position (only min_tp positions)
+        # Ranks beyond min_tp (orphaned) get singleton groups so they still
+        # belong to a DP group for correctness of GroupCoordinator init.
+        dp_groups = [[] for _ in range(min_tp)]
+        offset = 0
+        orphaned = []
+        for i in range(dp_size):
+            tsz = tp_sizes[i]
+            for t in range(min_tp):
+                dp_groups[t].append(offset + t)
+            for t in range(min_tp, tsz):
+                orphaned.append(offset + t)
+            offset += tsz
+        # Add singleton groups for orphaned ranks
+        for r in orphaned:
+            dp_groups.append([r])
+        _DP = init_model_parallel_group(
+            [list(map(int, g)) for g in dp_groups],
+            local_rank, backend, group_name="dp",
+        )
+
+        # EP group: all ranks (MoE experts span all ranks)
+        _EP = None
+        if config.model_config is None or config.model_config.is_moe:
+            ep_groups = [list(range(total_ranks))]
+            _EP = init_model_parallel_group(
+                [list(map(int, g)) for g in ep_groups],
+                local_rank, backend, group_name="ep",
+            )
+
+        # PP=1: use a single-group covering all ranks so
+        # model_parallel_is_initialized() returns True.
+        pp_groups = [list(range(total_ranks))]
+        _PP = init_model_parallel_group(
+            [list(map(int, g)) for g in pp_groups],
+            local_rank, backend, group_name="pp",
+        )
+        _DCP = None
+        _PCP = None
+        _EPLB = None
+        # Initialize inner DP world if needed (single-node: not needed)
+        _INNER_DP_WORLD = None
+        return
 
     # the layout order is: ExternalDP x DP x PP x TP
     # ExternalDP is the data parallel group that is not part of the model,

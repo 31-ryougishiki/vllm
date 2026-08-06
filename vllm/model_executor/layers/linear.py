@@ -448,12 +448,23 @@ class ColumnParallelLinear(LinearBase):
         self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
         self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
         self.input_size_per_partition = input_size
-        self.output_size_per_partition = divide(output_size, self.tp_size)
+
+        from vllm.distributed.utils import (
+            get_current_tp_sharding_ratios,
+            get_tp_partition_size,
+        )
+
+        _ratios = get_current_tp_sharding_ratios() if not disable_tp else None
+        self._tp_sharding_ratios = _ratios
+        self.output_size_per_partition = get_tp_partition_size(
+            output_size, self.tp_rank, self.tp_size, _ratios
+        )
         self.output_partition_sizes = [self.output_size_per_partition]
         # If QKV or MergedColumn, use output size of each partition.
         if hasattr(self, "output_sizes"):
             self.output_partition_sizes = [
-                divide(output_size, self.tp_size) for output_size in self.output_sizes
+                get_tp_partition_size(osz, self.tp_rank, self.tp_size, _ratios)
+                for osz in self.output_sizes
             ]
 
         super().__init__(
@@ -546,14 +557,32 @@ class ColumnParallelLinear(LinearBase):
         if is_gguf_weight and isinstance(param, UninitializedParameter):
             final_shape = list(loaded_weight.shape)
             if output_dim is not None:
-                assert final_shape[output_dim] % self.tp_size == 0
-                final_shape[output_dim] = final_shape[output_dim] // self.tp_size
+                if getattr(self, "_tp_sharding_ratios", None) is not None:
+                    from vllm.distributed.utils import get_tp_partition_size
+
+                    final_shape[output_dim] = get_tp_partition_size(
+                        final_shape[output_dim], self.tp_rank, self.tp_size,
+                        self._tp_sharding_ratios,
+                    )
+                else:
+                    assert final_shape[output_dim] % self.tp_size == 0
+                    final_shape[output_dim] = final_shape[output_dim] // self.tp_size
             param.materialize(final_shape, dtype=loaded_weight.dtype)
 
         param_data = param.data
         if output_dim is not None and not is_sharded_weight:
             shard_size = param_data.shape[output_dim]
-            start_idx = self.tp_rank * shard_size
+            if getattr(self, "_tp_sharding_ratios", None) is not None:
+                from vllm.distributed.utils import get_tp_partition_offset
+
+                start_idx = get_tp_partition_offset(
+                    total_size=loaded_weight.shape[output_dim],
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                    tp_sharding_ratios=self._tp_sharding_ratios,
+                )
+            else:
+                start_idx = self.tp_rank * shard_size
             loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
 
         # Special case for loading scales off disk, which often do not
@@ -645,7 +674,12 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
         self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
 
-        assert all(output_size % self.tp_size == 0 for output_size in output_sizes)
+        from vllm.distributed.utils import get_current_tp_sharding_ratios
+
+        _ratios = get_current_tp_sharding_ratios() if not disable_tp else None
+        self._tp_sharding_ratios = _ratios
+        if _ratios is None:
+            assert all(output_size % self.tp_size == 0 for output_size in output_sizes)
         super().__init__(
             input_size=input_size,
             output_size=sum(output_sizes),
@@ -804,8 +838,22 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         if output_dim is not None:
             shard_offset = sum(self.output_sizes[:loaded_shard_id])
             shard_size = self.output_sizes[loaded_shard_id]
-            shard_offset //= self.tp_size
-            shard_size //= self.tp_size
+            if getattr(self, "_tp_sharding_ratios", None) is not None:
+                from vllm.distributed.utils import get_tp_partition_size
+
+                ratios = self._tp_sharding_ratios
+                total_ratio = sum(ratios)
+                local_offset = 0
+                for i in range(loaded_shard_id):
+                    s = self.output_sizes[i]
+                    local_offset += s * ratios[self.tp_rank] // total_ratio
+                shard_offset = local_offset
+                shard_size = get_tp_partition_size(
+                    shard_size, self.tp_rank, self.tp_size, ratios
+                )
+            else:
+                shard_offset //= self.tp_size
+                shard_size //= self.tp_size
 
             if isinstance(param, BlockQuantScaleParameter):
                 weight_block_size = getattr(self, "weight_block_size", None)
@@ -841,7 +889,16 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                     param, orig_offsets, str(loaded_shard_id)
                 )
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
-            start_idx = self.tp_rank * shard_size
+            if getattr(self, "_tp_sharding_ratios", None) is not None:
+                from vllm.distributed.utils import get_tp_partition_offset
+
+                _full_sz = self.output_sizes[loaded_shard_id]
+                start_idx = get_tp_partition_offset(
+                    _full_sz, self.tp_rank, self.tp_size,
+                    self._tp_sharding_ratios,
+                )
+            else:
+                start_idx = self.tp_rank * shard_size
             if not is_sharded_weight:
                 loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
         # Special case for per-tensor scales in fused case.
@@ -951,8 +1008,27 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
         shard_offset = sum(self.output_sizes[:loaded_shard_id])
         shard_size = self.output_sizes[loaded_shard_id]
-        shard_offset //= self.tp_size
-        shard_size //= self.tp_size
+        if getattr(self, "_tp_sharding_ratios", None) is not None:
+            from vllm.distributed.utils import (
+                get_tp_partition_offset,
+                get_tp_partition_size,
+            )
+
+            # Compute the rank-local offset within merged weight: sum of
+            # asymmetric partitions of all preceding shards.
+            ratios = self._tp_sharding_ratios
+            total_ratio = sum(ratios)
+            local_offset = 0
+            for i in range(loaded_shard_id):
+                s = self.output_sizes[i]
+                local_offset += s * ratios[self.tp_rank] // total_ratio
+            shard_offset = local_offset
+            shard_size = get_tp_partition_size(
+                shard_size, self.tp_rank, self.tp_size, ratios
+            )
+        else:
+            shard_offset //= self.tp_size
+            shard_size //= self.tp_size
 
         if isinstance(param, BlockQuantScaleParameter):
             weight_block_size = getattr(self, "weight_block_size", None)
@@ -1439,7 +1515,17 @@ class RowParallelLinear(LinearBase):
         # Divide the weight matrix along the first dimension.
         self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
         self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
-        self.input_size_per_partition = divide(input_size, self.tp_size)
+
+        from vllm.distributed.utils import (
+            get_current_tp_sharding_ratios,
+            get_tp_partition_size,
+        )
+
+        _ratios = get_current_tp_sharding_ratios() if not disable_tp else None
+        self._tp_sharding_ratios = _ratios
+        self.input_size_per_partition = get_tp_partition_size(
+            input_size, self.tp_rank, self.tp_size, _ratios
+        )
         self.output_size_per_partition = output_size
         self.output_partition_sizes = [output_size]
 
@@ -1508,13 +1594,31 @@ class RowParallelLinear(LinearBase):
         if is_gguf_weight and isinstance(param, UninitializedParameter):
             weight_shape = list(loaded_weight.shape)
             if input_dim:
-                weight_shape[input_dim] = weight_shape[input_dim] // self.tp_size
+                if getattr(self, "_tp_sharding_ratios", None) is not None:
+                    from vllm.distributed.utils import get_tp_partition_size
+
+                    weight_shape[input_dim] = get_tp_partition_size(
+                        weight_shape[input_dim], self.tp_rank, self.tp_size,
+                        self._tp_sharding_ratios,
+                    )
+                else:
+                    weight_shape[input_dim] = weight_shape[input_dim] // self.tp_size
             param.materialize(tuple(weight_shape), dtype=loaded_weight.dtype)
 
         param_data = param.data
         if input_dim is not None and not is_sharded_weight:
             shard_size = param_data.shape[input_dim]
-            start_idx = self.tp_rank * shard_size
+            if getattr(self, "_tp_sharding_ratios", None) is not None:
+                from vllm.distributed.utils import get_tp_partition_offset
+
+                start_idx = get_tp_partition_offset(
+                    total_size=loaded_weight.shape[input_dim],
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                    tp_sharding_ratios=self._tp_sharding_ratios,
+                )
+            else:
+                start_idx = self.tp_rank * shard_size
             loaded_weight = loaded_weight.narrow(input_dim, start_idx, shard_size)
 
         # Special case for loading scales off disk, which often do not

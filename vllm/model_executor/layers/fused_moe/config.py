@@ -1075,10 +1075,27 @@ class FusedMoEParallelConfig:
         tp_size: int, dp_size: int, dp_rank: int, pcp_size: int, pcp_rank: int
     ) -> tuple[int, int]:
         tp_rank = 0 if tp_size == 1 else get_tensor_model_parallel_rank()
-        # There are actually dp_size * pcp_size * tp_size devices.
-        # Update tp_size and tp_rank so we shard across all devices.
-        flatten_tp_size = dp_size * pcp_size * tp_size
-        flatten_tp_rank = dp_rank * pcp_size * tp_size + pcp_rank * tp_size + tp_rank
+        # Check for heterogeneous TP (different tp sizes per DP rank)
+        from vllm.config import get_current_vllm_config_or_none
+
+        cfg = get_current_vllm_config_or_none()
+        if cfg is not None and cfg.parallel_config.is_heterogeneous_tp:
+            tp_sizes = [
+                cfg.parallel_config.get_tp_size_for_dp(i)
+                for i in range(dp_size)
+            ]
+            cum_offset = sum(tp_sizes[i] * pcp_size for i in range(dp_rank))
+            flatten_tp_size = sum(tp_sizes) * pcp_size
+            flatten_tp_rank = (
+                cum_offset + pcp_rank * tp_sizes[dp_rank] + tp_rank
+            )
+        else:
+            # There are actually dp_size * pcp_size * tp_size devices.
+            # Update tp_size and tp_rank so we shard across all devices.
+            flatten_tp_size = dp_size * pcp_size * tp_size
+            flatten_tp_rank = (
+                dp_rank * pcp_size * tp_size + pcp_rank * tp_size + tp_rank
+            )
         return flatten_tp_size, flatten_tp_rank
 
     @staticmethod
