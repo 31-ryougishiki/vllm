@@ -1187,7 +1187,15 @@ class ModelConfig:
     ) -> None:
         total_num_attention_heads = self.model_arch_config.total_num_attention_heads
         tensor_parallel_size = parallel_config.tensor_parallel_size
-        if total_num_attention_heads % tensor_parallel_size != 0:
+        # Skip divisibility check when asymmetric sharding ratios are set
+        # for this DP rank (e.g., tp=3 with ratios [2,1,1] for 64 heads).
+        _has_asymmetric = (
+            parallel_config.is_heterogeneous_tp
+            and parallel_config.get_sharding_ratios_for_dp(
+                parallel_config.data_parallel_rank
+            ) is not None
+        )
+        if not _has_asymmetric and total_num_attention_heads % tensor_parallel_size != 0:
             raise ValueError(
                 f"Total number of attention heads ({total_num_attention_heads})"
                 " must be divisible by tensor parallel size "
