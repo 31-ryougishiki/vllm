@@ -1803,11 +1803,13 @@ def initialize_model_parallel(
                 local_rank, backend, group_name="ep",
             )
 
-        # PP=1: use a single-group covering all ranks so
-        # model_parallel_is_initialized() returns True.
-        pp_groups = [list(range(total_ranks))]
+        # PP=1: each rank is its own singleton group. This matches the
+        # homogeneous-path behaviour for pipeline_parallel_size=1 and is
+        # REQUIRED for correctness: a single all-ranks group would make
+        # get_pp_group().world_size == 15, which vLLM interprets as PP=15
+        # and shards the model by layer across workers.
         _PP = init_model_parallel_group(
-            [list(map(int, g)) for g in pp_groups],
+            [[r] for r in range(total_ranks)],
             local_rank, backend, group_name="pp",
         )
         # DCP/PCP=1: each rank is its own singleton group (matches
