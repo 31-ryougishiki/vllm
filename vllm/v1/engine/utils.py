@@ -297,6 +297,13 @@ def set_device_control_env_var(
     offset = None
     if parallel_config.is_heterogeneous_tp:
         offset = parallel_config.get_rank_offset_for_dp(local_dp_rank)
+        # Use target DP rank's world_size, not the launcher's (DP0's)
+        dp_tp = parallel_config.get_tp_size_for_dp(local_dp_rank)
+        local_world_size = (
+            dp_tp
+            * parallel_config.pipeline_parallel_size
+            * parallel_config.prefill_context_parallel_size
+        ) // parallel_config.nnodes_within_dp
     value = get_device_indices(
         evar, local_dp_rank, world_size, local_world_size, offset=offset
     )
