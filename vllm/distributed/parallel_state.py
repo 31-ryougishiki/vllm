@@ -1810,8 +1810,16 @@ def initialize_model_parallel(
             [list(map(int, g)) for g in pp_groups],
             local_rank, backend, group_name="pp",
         )
-        _DCP = None
-        _PCP = None
+        # DCP/PCP=1: each rank is its own singleton group (matches
+        # homogeneous-path behaviour for size-1 context parallelism).
+        _DCP = init_model_parallel_group(
+            [[r] for r in range(total_ranks)],
+            local_rank, backend, group_name="dcp",
+        )
+        _PCP = init_model_parallel_group(
+            [[r] for r in range(total_ranks)],
+            local_rank, backend, group_name="pcp",
+        )
         _EPLB = None
         # Initialize inner DP world if needed (single-node: not needed)
         _INNER_DP_WORLD = None
