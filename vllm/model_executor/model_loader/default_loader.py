@@ -357,7 +357,12 @@ class DefaultModelLoader(BaseModelLoader):
         dp_size = parallel_config.data_parallel_size
         tp_size = parallel_config.tensor_parallel_size
         pcp_size = parallel_config.prefill_context_parallel_size
-        dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
+        # NOTE: for heterogeneous TP, use the true dp_rank from config since
+        # the DP group of an orphaned TP rank is a singleton (rank_in_group=0).
+        if parallel_config.is_heterogeneous_tp:
+            dp_rank = parallel_config.data_parallel_rank
+        else:
+            dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
         tp_rank = get_tensor_model_parallel_rank() if tp_size > 1 else 0
         pcp_rank = get_pcp_group().rank_in_group if pcp_size > 1 else 0
         if parallel_config.is_heterogeneous_tp:
