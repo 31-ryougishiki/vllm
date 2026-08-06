@@ -260,6 +260,14 @@ class FusedMoE(PluggableLayer):
 
         self.top_k = top_k
 
+        logger.info(
+            "[hetero-debug] layer: intermediate=%s tp_size=%s use_ep=%s "
+            "ep_size=%s ep_rank=%s global_num_experts=%s",
+            intermediate_size, self.tp_size, self.use_ep,
+            self.moe_parallel_config.ep_size,
+            self.moe_parallel_config.ep_rank,
+            self.global_num_experts,
+        )
         assert intermediate_size % self.tp_size == 0
         intermediate_size_per_partition = intermediate_size // self.tp_size
         self.renormalize = renormalize

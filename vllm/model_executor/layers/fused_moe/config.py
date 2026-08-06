@@ -1189,6 +1189,13 @@ class FusedMoEParallelConfig:
             dp_size_ * pcp_size_ * tp_size_ > 1
             and vllm_parallel_config.enable_expert_parallel
         )
+        logger.info(
+            "[hetero-debug] make: use_ep=%s dp_size_=%s pcp_size_=%s "
+            "tp_size_=%s enable_ep=%s is_het=%s",
+            use_ep, dp_size_, pcp_size_, tp_size_,
+            vllm_parallel_config.enable_expert_parallel,
+            vllm_parallel_config.is_heterogeneous_tp,
+        )
 
         if vllm_parallel_config.is_heterogeneous_tp:
             # Under heterogeneous TP the DP group of an orphaned TP rank is a
