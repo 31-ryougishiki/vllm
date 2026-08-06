@@ -3,6 +3,7 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from math import lcm
 
 import torch
 import torch.nn.functional as F
@@ -94,23 +95,6 @@ def vocab_range_from_per_partition_vocab_size(
 def vocab_range_from_global_vocab_size(
     global_vocab_size: int, rank: int, world_size: int, offset: int = 0
 ) -> Sequence[int]:
-    # Support asymmetric TP sharding for heterogeneous DP deployments
-    # (e.g. tp=3 with ratios [2,1,1] and vocab_size=129280).
-    from vllm.distributed.utils import (
-        get_current_tp_sharding_ratios,
-        get_tp_partition_offset,
-        get_tp_partition_size,
-    )
-
-    ratios = get_current_tp_sharding_ratios()
-    if ratios is not None:
-        start = offset + get_tp_partition_offset(
-            global_vocab_size, rank, world_size, ratios
-        )
-        end = start + get_tp_partition_size(
-            global_vocab_size, rank, world_size, ratios
-        )
-        return start, end
     per_partition_vocab_size = divide(global_vocab_size, world_size)
     return vocab_range_from_per_partition_vocab_size(
         per_partition_vocab_size, rank, offset=offset
@@ -266,11 +250,16 @@ class VocabParallelEmbedding(PluggableLayer):
         self.padding_size = padding_size
         self.org_vocab_size = org_num_embeddings or num_embeddings
         num_added_embeddings = num_embeddings - self.org_vocab_size
+        # Pad the vocab to a multiple of tp_size as well, so that every rank
+        # gets an equal (uniform) partition. Asymmetric sharding is NOT
+        # supported for the vocab dimension because logits gathering via
+        # all_gather_into_tensor requires uniform-sized tensors across ranks.
+        pad_to = lcm(self.padding_size, self.tp_size)
         self.org_vocab_size_padded = pad_vocab_size(
-            self.org_vocab_size, self.padding_size
+            self.org_vocab_size, pad_to
         )
         self.num_embeddings_padded = pad_vocab_size(
-            self.org_vocab_size_padded + num_added_embeddings, self.padding_size
+            self.org_vocab_size_padded + num_added_embeddings, pad_to
         )
         assert self.org_vocab_size_padded <= self.num_embeddings_padded
 
