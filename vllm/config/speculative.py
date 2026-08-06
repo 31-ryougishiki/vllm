@@ -955,6 +955,8 @@ class SpeculativeConfig:
             pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
             tensor_parallel_size=speculative_draft_tensor_parallel_size,
             heterogeneous_dp_config=target_parallel_config.heterogeneous_dp_config,
+            data_parallel_size=target_parallel_config.data_parallel_size,
+            data_parallel_rank=target_parallel_config.data_parallel_rank,
             distributed_executor_backend=target_parallel_config.distributed_executor_backend,
             max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,
             disable_custom_all_reduce=target_parallel_config.disable_custom_all_reduce,
