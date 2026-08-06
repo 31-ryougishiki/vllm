@@ -77,7 +77,13 @@ def get_tp_partition_size(
     behaviour).  Otherwise ratios are interpreted as relative weights, e.g.
     ``[2, 1, 1]`` means 50%/25%/25%.  Any remainder is assigned to the last
     rank.
+
+    When ``tp_size == 1`` the rank is NOT TP-sharded (e.g. the draft model
+    runs with a temporarily patched size-1 TP group), so this rank holds the
+    full tensor regardless of ratios.
     """
+    if tp_size == 1:
+        return total_size
     if tp_sharding_ratios is None:
         return divide(total_size, tp_size)
     total_ratio = sum(tp_sharding_ratios)
@@ -95,7 +101,11 @@ def get_tp_partition_offset(
 ) -> int:
     """Return the starting offset for ``tp_rank`` when splitting ``total_size``
     across ``tp_size`` ranks (cumulative sum of preceding partition sizes).
+
+    When ``tp_size == 1`` the rank is NOT TP-sharded, so the offset is 0.
     """
+    if tp_size == 1:
+        return 0
     if tp_sharding_ratios is None:
         return tp_rank * divide(total_size, tp_size)
     total_ratio = sum(tp_sharding_ratios)
