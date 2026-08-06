@@ -94,6 +94,23 @@ def vocab_range_from_per_partition_vocab_size(
 def vocab_range_from_global_vocab_size(
     global_vocab_size: int, rank: int, world_size: int, offset: int = 0
 ) -> Sequence[int]:
+    # Support asymmetric TP sharding for heterogeneous DP deployments
+    # (e.g. tp=3 with ratios [2,1,1] and vocab_size=129280).
+    from vllm.distributed.utils import (
+        get_current_tp_sharding_ratios,
+        get_tp_partition_offset,
+        get_tp_partition_size,
+    )
+
+    ratios = get_current_tp_sharding_ratios()
+    if ratios is not None:
+        start = offset + get_tp_partition_offset(
+            global_vocab_size, rank, world_size, ratios
+        )
+        end = start + get_tp_partition_size(
+            global_vocab_size, rank, world_size, ratios
+        )
+        return start, end
     per_partition_vocab_size = divide(global_vocab_size, world_size)
     return vocab_range_from_per_partition_vocab_size(
         per_partition_vocab_size, rank, offset=offset
