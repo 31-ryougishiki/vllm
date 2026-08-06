@@ -1521,8 +1521,9 @@ def init_distributed_environment(
     backend: str = "nccl",
     timeout: timedelta | None = None,
 ):
-    logger.debug(
-        "world_size=%d rank=%d local_rank=%d distributed_init_method=%s backend=%s",
+    logger.info(
+        "ENTER init_distributed_environment: world_size=%d rank=%d "
+        "local_rank=%d init_method=%s backend=%s",
         world_size,
         rank,
         local_rank,
@@ -1558,6 +1559,12 @@ def init_distributed_environment(
         if parallel_config.nnodes > 1:
             ip = parallel_config.master_addr
             port = parallel_config.master_port
+            distributed_init_method = get_distributed_init_method(ip, port)
+        elif parallel_config.is_heterogeneous_tp:
+            # Heterogeneous TP: all DP ranks must rendezvous on the SAME port
+            # because we form one global process group across all DP ranks.
+            ip = parallel_config.data_parallel_master_ip
+            port = parallel_config.data_parallel_master_port
             distributed_init_method = get_distributed_init_method(ip, port)
         else:
             ip = parallel_config.data_parallel_master_ip
