@@ -1153,6 +1153,16 @@ class EngineCoreProc(EngineCore):
             if data_parallel and vllm_config.model_config.is_moe:
                 # Set data parallel rank for this engine process.
                 parallel_config.data_parallel_rank = dp_rank
+                # Recalculate world_size for heterogeneous TP (__post_init__
+                # runs during unpickling before data_parallel_rank is set).
+                if parallel_config.is_heterogeneous_tp:
+                    my_tp = parallel_config.get_tp_size_for_dp(dp_rank)
+                    parallel_config.tensor_parallel_size = my_tp
+                    parallel_config.world_size = (
+                        parallel_config.pipeline_parallel_size
+                        * my_tp
+                        * parallel_config.prefill_context_parallel_size
+                    )
                 engine_core = DPEngineCoreProc(*args, **kwargs)
             else:
                 # Non-MoE DP ranks are completely independent, so treat like DP=1.
