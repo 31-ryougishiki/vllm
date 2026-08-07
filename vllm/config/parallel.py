@@ -873,10 +873,11 @@ class ParallelConfig:
         }
         if self.is_heterogeneous_tp:
             # Under heterogeneous TP each DP rank intentionally has a
-            # different tensor_parallel_size (e.g. 3 vs 4), so it must not
-            # diverge the DP worker configuration hash used to validate
-            # collective-communication consistency across DP ranks.
-            ignored_factors.add("tensor_parallel_size")
+            # different tensor_parallel_size (e.g. 3 vs 4) and therefore a
+            # different derived world_size, so both must not diverge the DP
+            # worker configuration hash used to validate collective-
+            # communication consistency across DP ranks.
+            ignored_factors.update({"tensor_parallel_size", "world_size"})
 
         from vllm.config.utils import get_hash_factors, hash_factors
 
