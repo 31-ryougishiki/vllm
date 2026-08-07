@@ -671,6 +671,11 @@ class MoERunner(MoERunnerInterface):
         fused_output = self.apply_routed_output_transform(fused_output)
 
         if shared_output is not None:
+            # Under heterogeneous TP, the shared expert processes padded
+            # tokens while the routed expert output is already unpadded
+            # by the EP all_gather + ragged unpad path.  Align sizes.
+            if shared_output.shape[0] != fused_output.shape[0]:
+                shared_output = shared_output[:fused_output.shape[0], ...]
             result = shared_output + fused_output
         else:
             result = fused_output
