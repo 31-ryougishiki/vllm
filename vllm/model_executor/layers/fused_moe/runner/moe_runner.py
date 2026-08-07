@@ -681,11 +681,6 @@ class MoERunner(MoERunnerInterface):
                     fused_output,
                     (0, 0, 0, shared_output.shape[0] - fused_output.shape[0]),
                 )
-            print(
-                f"MOE_RUNNER_DBG shared={tuple(shared_output.shape)} "
-                f"fused={tuple(fused_output.shape)}",
-                flush=True,
-            )
             result = shared_output + fused_output
         else:
             result = fused_output
