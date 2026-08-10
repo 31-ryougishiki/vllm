@@ -3291,20 +3291,6 @@ class GPUModelRunner(
             inputs_embeds = None
             model_kwargs = self._init_model_kwargs()
 
-        # DIAG: sync probe at midpoint of _preprocess (after input/model_kwargs setup,
-        # before positions/intermediate_tensors). Bisecting inside _preprocess.
-        import time as _time_diag
-        _t_sync0 = _time_diag.perf_counter()
-        torch.npu.synchronize()
-        _t_sync1 = _time_diag.perf_counter()
-        _sync_ms = (_t_sync1 - _t_sync0) * 1000.0
-        if _sync_ms > 10.0:
-            from vllm.logger import init_logger as _init_logger_diag
-            _init_logger_diag(__name__).warning(
-                "DIAG sync_mid_preprocess: %.1fms (num_input_tokens=%d)",
-                _sync_ms, num_input_tokens,
-            )
-
         if self.uses_mrope:
             positions = self.mrope_positions.gpu[:, :num_input_tokens]
         elif self.uses_xdrope_dim > 0:
