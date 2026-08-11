@@ -103,7 +103,8 @@ class _Span:
     """Single node in the call tree.  Internal — not part of the public API."""
 
     __slots__ = (
-        "name", "start_us", "end_us", "children", "attrs",
+        "name", "start_us", "end_us", "host_start_us", "host_end_us",
+        "children", "attrs",
         "_start_event", "_end_event",
     )
 
@@ -115,8 +116,12 @@ class _Span:
         end_us: float = 0.0,
     ) -> None:
         self.name = name
-        self.start_us = start_us  # 0 = untimed
-        self.end_us: float = end_us  # 0 = untimed
+        self.start_us = start_us  # 0 = untimed (NPU-event mode keeps this 0)
+        self.end_us: float = end_us  # 0 = untimed (NPU-event mode: device us)
+        # Host wall-clock (relative to step_begin's _t0_us).  Recorded even in
+        # NPU-event mode so host vs device time can be compared per span.
+        self.host_start_us: float = 0.0
+        self.host_end_us: float = 0.0
         self.children: list[_Span] = []
         self.attrs: dict[str, Any] = attrs or {}
         self._start_event: Any = None  # torch.npu.Event when NPU timing
@@ -124,11 +129,21 @@ class _Span:
 
     @property
     def is_timed(self) -> bool:
-        return self.start_us > 0 or self.end_us > 0
+        return (
+            self.start_us > 0 or self.end_us > 0
+            or self.host_start_us > 0 or self.host_end_us > 0
+        )
 
     @property
     def duration_us(self) -> float:
         return max(0.0, self.end_us - self.start_us)
+
+    @property
+    def host_duration_us(self) -> float:
+        """Host wall-clock duration of this span (relative to step_begin)."""
+        if self.host_end_us > 0 and self.host_start_us > 0:
+            return max(0.0, self.host_end_us - self.host_start_us)
+        return self.duration_us  # fall back to recorded/device duration
 
 
 # ---------------------------------------------------------------------------
@@ -266,10 +281,13 @@ class CallStackTracer:
             self._step_id = step_id or f"step_{self._step_count}"
             self._step_metadata = dict(metadata or {})
             if self._use_npu_timing:
-                self._t0_us = 0.0
+                # Keep a host _t0_us too so per-span host wall-clock times
+                # (host_start_us / host_end_us) are relative to step start.
+                self._t0_us = time.perf_counter_ns() / 1000.0
                 self._root = _Span(self._step_id, start_us=0.0)
                 self._root._start_event = self._create_npu_event()
                 self._root._start_event.record()
+                self._root.host_start_us = 0.0
             else:
                 self._t0_us = time.perf_counter_ns() / 1000.0
                 self._root = _Span(self._step_id, start_us=0.0)
@@ -290,6 +308,9 @@ class CallStackTracer:
                 ):
                     self._root._end_event = self._create_npu_event()
                     self._root._end_event.record()
+                    self._root.host_end_us = (
+                        time.perf_counter_ns() / 1000.0 - self._t0_us
+                    )
                     self._synchronize_npu()
                     self._compute_npu_durations(self._root)
                 else:
@@ -343,6 +364,11 @@ class CallStackTracer:
             if self._use_npu_timing:
                 node._start_event = self._create_npu_event()
                 node._start_event.record()
+                # Host wall-clock captured alongside the NPU event so the
+                # host-vs-device split can be diagnosed per span.
+                node.host_start_us = (
+                    time.perf_counter_ns() / 1000.0 - self._t0_us
+                )
             else:
                 # All timestamps are relative to step_begin's _t0_us so that
                 # Chrome Trace output and duration calculations are consistent.
@@ -362,6 +388,9 @@ class CallStackTracer:
                 if self._use_npu_timing:
                     node._end_event = self._create_npu_event()
                     node._end_event.record()
+                    node.host_end_us = (
+                        time.perf_counter_ns() / 1000.0 - self._t0_us
+                    )
                 else:
                     node.end_us = (
                         time.perf_counter_ns() / 1000.0 - self._t0_us
@@ -469,11 +498,19 @@ class CallStackTracer:
 
         return obj
 
-    def flatten_spans(self) -> dict[str, float]:
+    def flatten_spans(self, timing: str = "auto") -> dict[str, float]:
         """Walk the span tree and return a flat dict of ``path → duration_us``.
 
         Paths are built by joining span names with ``"/"``, skipping the
         root step span itself.  Only timed spans are included.
+
+        Args:
+            timing:
+                ``"auto"`` (default) — device-elapsed when ``use_npu_timing``
+                else host wall-clock (matches historical behaviour).
+                ``"host"`` — host wall-clock durations for every span.
+                ``"dev"`` — device-elapsed durations (falls back to host when
+                NPU event timing is disabled).
 
         Example::
 
@@ -482,20 +519,25 @@ class CallStackTracer:
         """
         if self._root is None:
             return {}
+        _use_host = (timing == "host") or (
+            timing == "auto" and not self._use_npu_timing
+        )
         result: dict[str, float] = {}
         for child in self._root.children:
-            self._flatten_child(child, "", result)
+            self._flatten_child(child, "", result, _use_host)
         return result
 
     @staticmethod
     def _flatten_child(
-        span: _Span, prefix: str, result: dict[str, float]
+        span: _Span, prefix: str, result: dict[str, float],
+        use_host: bool = False,
     ) -> None:
         path = f"{prefix}/{span.name}" if prefix else span.name
-        if span.is_timed and span.duration_us > 0:
-            result[path] = span.duration_us
+        dur_us = span.host_duration_us if use_host else span.duration_us
+        if span.is_timed and dur_us > 0:
+            result[path] = dur_us
         for child in span.children:
-            CallStackTracer._flatten_child(child, path, result)
+            CallStackTracer._flatten_child(child, path, result, use_host)
 
     # -- internals -----------------------------------------------------------
 
