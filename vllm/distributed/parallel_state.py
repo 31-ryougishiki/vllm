@@ -1749,7 +1749,14 @@ def initialize_model_parallel(
         global _TP, _DP, _EP, _PP, _DCP, _PCP, _EPLB
         assert _TP is None, "tensor model parallel group is already initialized"
 
-        local_rank = get_world_group().local_rank
+        # HETEROGENEOUS-FIX: bind the device communicator by GLOBAL rank, not the
+        # DP-local index.  The HCCL communicator numbers ranks by global rank
+        # (offset by get_rank_offset_for_dp), so a DP-local device index (0..3)
+        # mismatches the global rank (3..6) and HCCL warns + may rotate data in
+        # reduce_scatter/all_gather.  This requires the visible-device set to be
+        # identity-mapped (see set_device_control_env_var), so npu:{global_rank}
+        # addresses the correct physical device.
+        local_rank = get_world_group().rank
         backend = backend or torch.distributed.get_backend(
             get_world_group().device_group
         )

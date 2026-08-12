@@ -268,8 +268,18 @@ class Worker(WorkerBase):
                     * self.parallel_config.tensor_parallel_size
                 )
 
-                # DP_LOCAL_RANK * TP_PP_WORLD_SIZE + TP_LOCAL_RANK
-                self.local_rank += dp_local_rank * tp_pp_world_size
+                if self.parallel_config.is_heterogeneous_tp:
+                    # HETEROGENEOUS-FIX: device index must equal the GLOBAL
+                    # (torch) rank so HCCL rank<->device align.  DP offsets are
+                    # the cumulative actual TP sizes (get_rank_offset_for_dp),
+                    # NOT dp*uniform_tp (DP0's tp=3 makes these differ).  This
+                    # pairs with identity-mapped visible devices.
+                    self.local_rank += self.parallel_config.get_rank_offset_for_dp(
+                        dp_local_rank
+                    )
+                else:
+                    # DP_LOCAL_RANK * TP_PP_WORLD_SIZE + TP_LOCAL_RANK
+                    self.local_rank += dp_local_rank * tp_pp_world_size
                 assert self.local_rank < torch.accelerator.device_count(), (
                     f"DP adjusted local rank {self.local_rank} is out of bounds. "
                 )
