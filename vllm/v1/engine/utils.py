@@ -304,32 +304,11 @@ def set_device_control_env_var(
             * parallel_config.pipeline_parallel_size
             * parallel_config.prefill_context_parallel_size
         ) // parallel_config.nnodes_within_dp
-        device_ids = get_hetero_device_ids()
-        if device_ids is not None:
-            # EXPLICIT per-DP device list: each DP gets the physical devices of
-            # its own ranks (device_ids[offset:offset+local_world_size]), keeping
-            # per-DP isolation while binding to explicit physical devices instead
-            # of assuming the layout is contiguous [offset, offset+tp).
-            value = ",".join(str(d) for d in device_ids[offset : offset + local_world_size])
-            with patch.dict(os.environ, values=((evar, value),)):
-                yield
-            return
     value = get_device_indices(
         evar, local_dp_rank, world_size, local_world_size, offset=offset
     )
     with patch.dict(os.environ, values=((evar, value),)):
         yield
-
-
-def get_hetero_device_ids() -> list[int] | None:
-    """Parse VLLM_HETERO_DEVICE_IDS (comma-separated physical device ids, one
-    per GLOBAL rank, in rank order).  Returns None if unset.  Each DP then
-    binds its ranks to the explicit physical devices in this list instead of
-    assuming a contiguous layout."""
-    raw = os.environ.get("VLLM_HETERO_DEVICE_IDS")
-    if not raw:
-        return None
-    return [int(x) for x in raw.split(",") if x.strip()]
 
 
 def get_device_indices(
