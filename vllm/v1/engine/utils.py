@@ -296,26 +296,24 @@ def set_device_control_env_var(
 
     offset = None
     if parallel_config.is_heterogeneous_tp:
-        device_ids = get_hetero_device_ids()
-        if device_ids is not None:
-            # HETEROGENEOUS-FIX: expose the EXPLICIT device-id list (one per
-            # global rank, in rank order) to EVERY worker.  The visible index
-            # then equals the global rank, so each rank binds npu:{global_rank}
-            # = device_ids[global_rank], and HCCL rank (global) == visible
-            # index == device index -> aligned.  Do not rely on offset math.
-            value = ",".join(str(d) for d in device_ids)
-            with patch.dict(os.environ, values=((evar, value),)):
-                yield
-            return
-        dp_size = parallel_config.data_parallel_size
-        offset = 0
+        offset = parallel_config.get_rank_offset_for_dp(local_dp_rank)
+        # Use target DP rank's world_size, not the launcher's (DP0's)
+        dp_tp = parallel_config.get_tp_size_for_dp(local_dp_rank)
         local_world_size = (
-            sum(
-                parallel_config.get_tp_size_for_dp(i) for i in range(dp_size)
-            )
+            dp_tp
             * parallel_config.pipeline_parallel_size
             * parallel_config.prefill_context_parallel_size
         ) // parallel_config.nnodes_within_dp
+        device_ids = get_hetero_device_ids()
+        if device_ids is not None:
+            # EXPLICIT per-DP device list: each DP gets the physical devices of
+            # its own ranks (device_ids[offset:offset+local_world_size]), keeping
+            # per-DP isolation while binding to explicit physical devices instead
+            # of assuming the layout is contiguous [offset, offset+tp).
+            value = ",".join(str(d) for d in device_ids[offset : offset + local_world_size])
+            with patch.dict(os.environ, values=((evar, value),)):
+                yield
+            return
     value = get_device_indices(
         evar, local_dp_rank, world_size, local_world_size, offset=offset
     )
@@ -325,9 +323,9 @@ def set_device_control_env_var(
 
 def get_hetero_device_ids() -> list[int] | None:
     """Parse VLLM_HETERO_DEVICE_IDS (comma-separated physical device ids, one
-    per GLOBAL rank, in rank order).  Returns None if unset.  Used so each
-    heterogeneous TP rank binds to an EXPLICIT physical device instead of
-    relying on offset math, keeping HCCL rank == device index aligned."""
+    per GLOBAL rank, in rank order).  Returns None if unset.  Each DP then
+    binds its ranks to the explicit physical devices in this list instead of
+    assuming a contiguous layout."""
     raw = os.environ.get("VLLM_HETERO_DEVICE_IDS")
     if not raw:
         return None

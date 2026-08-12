@@ -2139,30 +2139,26 @@ class EngineCoreActorMixin:
         self, vllm_config: VllmConfig, local_dp_rank: int, device_control_env_var: str
     ):
         parallel_config = vllm_config.parallel_config
+        parallel_config = vllm_config.parallel_config
         world_size = parallel_config.world_size
         offset = None
         local_world_size = None
         if parallel_config.is_heterogeneous_tp:
-            # HETEROGENEOUS-FIX: expose the EXPLICIT device-id list (see
-            # get_hetero_device_ids) so visible index == global rank and
-            # HCCL rank == device index stays aligned.
+            offset = parallel_config.get_rank_offset_for_dp(local_dp_rank)
             from vllm.v1.engine.utils import get_hetero_device_ids
 
             device_ids = get_hetero_device_ids()
             if device_ids is not None:
+                dp_tp = parallel_config.get_tp_size_for_dp(local_dp_rank)
+                local_world_size = (
+                    dp_tp
+                    * parallel_config.pipeline_parallel_size
+                    * parallel_config.prefill_context_parallel_size
+                ) // parallel_config.nnodes_within_dp
                 os.environ[device_control_env_var] = ",".join(
-                    str(d) for d in device_ids
+                    str(d) for d in device_ids[offset : offset + local_world_size]
                 )
                 return
-            dp_size = parallel_config.data_parallel_size
-            offset = 0
-            local_world_size = (
-                sum(
-                    parallel_config.get_tp_size_for_dp(i) for i in range(dp_size)
-                )
-                * parallel_config.pipeline_parallel_size
-                * parallel_config.prefill_context_parallel_size
-            ) // parallel_config.nnodes_within_dp
         # Set CUDA_VISIBLE_DEVICES or equivalent.
         try:
             value = get_device_indices(
