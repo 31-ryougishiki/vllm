@@ -619,14 +619,16 @@ class WorkerProc:
         self.worker = wrapper
 
         self.setup_proc_title_and_log_prefix(
-            enable_ep=vllm_config.parallel_config.enable_expert_parallel
+            enable_ep=vllm_config.parallel_config.enable_expert_parallel,
+            vllm_config=vllm_config,
         )
 
         # Load model
         self.worker.init_device()
         # Update process title now that parallel groups are initialized
         self.setup_proc_title_and_log_prefix(
-            enable_ep=vllm_config.parallel_config.enable_expert_parallel
+            enable_ep=vllm_config.parallel_config.enable_expert_parallel,
+            vllm_config=vllm_config,
         )
         if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
             self.worker.elastic_ep_execute("load_model")
@@ -995,7 +997,9 @@ class WorkerProc:
                 self.handle_output(output)
 
     @staticmethod
-    def setup_proc_title_and_log_prefix(enable_ep: bool) -> None:
+    def setup_proc_title_and_log_prefix(
+        enable_ep: bool, vllm_config: VllmConfig | None = None
+    ) -> None:
         # Check if parallel groups are initialized first
         if not model_parallel_is_initialized():
             # Parallel groups not yet initialized, use default process name
@@ -1003,8 +1007,19 @@ class WorkerProc:
             decorate_logs("Worker")
             return
 
-        dp_size = get_dp_group().world_size
-        dp_rank = get_dp_group().rank_in_group
+        # Under heterogeneous TP the "orphaned" TP ranks (those beyond
+        # min(tp_size(dp))) get singleton DP groups, so
+        # get_dp_group().world_size is 1 for them and the DP suffix would be
+        # dropped from the process title/log prefix. Read the logical DP size
+        # and rank from the parallel config instead so the prefix stays
+        # WORKER_DP{dp}_TP{tp}_EP{ep} for every rank.
+        if vllm_config is not None and vllm_config.parallel_config.is_heterogeneous_tp:
+            parallel_config = vllm_config.parallel_config
+            dp_size = parallel_config.data_parallel_size
+            dp_rank = parallel_config.data_parallel_rank
+        else:
+            dp_size = get_dp_group().world_size
+            dp_rank = get_dp_group().rank_in_group
         pp_size = get_pp_group().world_size
         pp_rank = get_pp_group().rank_in_group
         pcp_size = get_pcp_group().world_size
