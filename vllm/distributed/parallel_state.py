@@ -1823,8 +1823,6 @@ def initialize_model_parallel(
             local_rank, backend, group_name="pcp",
         )
         _EPLB = None
-        # Initialize inner DP world if needed (single-node: not needed)
-        _INNER_DP_WORLD = None
         return
 
     # the layout order is: ExternalDP x DP x PP x TP

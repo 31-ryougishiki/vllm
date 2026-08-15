@@ -505,14 +505,34 @@ class ParallelConfig:
                 )
 
         if self.is_heterogeneous_tp:
-            tp_sizes = [
-                self.get_tp_size_for_dp(i) for i in range(self.data_parallel_size)
-            ]
-            if len({c.dp_rank for c in self.heterogeneous_dp_config}) != self.data_parallel_size:
+            if self.heterogeneous_dp_config is None:
+                raise ValueError(
+                    "heterogeneous_dp_config must be a non-empty list when "
+                    "is_heterogeneous_tp is True."
+                )
+            config_ranks = {
+                cfg.dp_rank for cfg in self.heterogeneous_dp_config
+            }
+            if config_ranks != set(range(self.data_parallel_size)):
                 raise ValueError(
                     "heterogeneous_dp_config must cover all dp_ranks "
                     "0..data_parallel_size-1 exactly once."
                 )
+            for cfg in self.heterogeneous_dp_config:
+                ratios = cfg.tp_sharding_ratios
+                if ratios is None:
+                    continue
+                if len(ratios) != cfg.tp_size:
+                    raise ValueError(
+                        "tp_sharding_ratios length must equal tp_size for "
+                        f"dp_rank={cfg.dp_rank}: len(ratios)={len(ratios)}, "
+                        f"tp_size={cfg.tp_size}."
+                    )
+                if any(ratio <= 0 for ratio in ratios):
+                    raise ValueError(
+                        "tp_sharding_ratios entries must be positive integers "
+                        f"for dp_rank={cfg.dp_rank}, got {ratios}."
+                    )
             if self.enable_eplb:
                 raise ValueError(
                     "heterogeneous_dp_config is incompatible with EPLB "
@@ -906,7 +926,13 @@ class ParallelConfig:
 
         if self.distributed_executor_backend == "external_launcher":
             logger.info("Using external launcher for distributed inference.")
-            self.world_size *= self.data_parallel_size
+            if self.is_heterogeneous_tp:
+                # __post_init__ above set world_size to the local DP rank's
+                # world size (tp_size(dp) * pp * pcp); the external launcher
+                # needs the total size across the heterogeneous DP ranks.
+                self.world_size = self.world_size_across_dp
+            else:
+                self.world_size *= self.data_parallel_size
 
         if self.enable_elastic_ep:
             if not self.enable_eplb:

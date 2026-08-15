@@ -2139,15 +2139,28 @@ class EngineCoreActorMixin:
         self, vllm_config: VllmConfig, local_dp_rank: int, device_control_env_var: str
     ):
         parallel_config = vllm_config.parallel_config
-        parallel_config = vllm_config.parallel_config
         world_size = parallel_config.world_size
+        local_world_size = world_size
         offset = None
         if parallel_config.is_heterogeneous_tp:
             offset = parallel_config.get_rank_offset_for_dp(local_dp_rank)
+            # The launcher's ``world_size`` is only valid for DP rank 0.  Each
+            # DP rank owns ``tp_size(dp)`` devices, so compute the target
+            # rank's local world size explicitly instead of reusing DP0's.
+            dp_tp = parallel_config.get_tp_size_for_dp(local_dp_rank)
+            local_world_size = (
+                dp_tp
+                * parallel_config.pipeline_parallel_size
+                * parallel_config.prefill_context_parallel_size
+            ) // parallel_config.nnodes_within_dp
         # Set CUDA_VISIBLE_DEVICES or equivalent.
         try:
             value = get_device_indices(
-                device_control_env_var, local_dp_rank, world_size, offset=offset
+                device_control_env_var,
+                local_dp_rank,
+                world_size,
+                local_world_size=local_world_size,
+                offset=offset,
             )
             os.environ[device_control_env_var] = value
         except IndexError as e:
@@ -2155,7 +2168,7 @@ class EngineCoreActorMixin:
                 offset if offset is not None
                 else local_dp_rank * world_size
             )
-            actual_end = actual_start + parallel_config.local_world_size
+            actual_end = actual_start + local_world_size
             raise Exception(
                 f"Error setting {device_control_env_var}: "
                 f"local range: [{actual_start}, {actual_end}) "
@@ -2217,7 +2230,18 @@ class DPMoEEngineCoreActor(EngineCoreActorMixin, DPEngineCoreProc):
         dp_rank: int = 0,
         local_dp_rank: int = 0,
     ):
-        vllm_config.parallel_config.data_parallel_rank = dp_rank
+        parallel_config = vllm_config.parallel_config
+        parallel_config.data_parallel_rank = dp_rank
+        # Recalculate world_size for heterogeneous TP (__post_init__ runs
+        # during unpickling before data_parallel_rank is set).
+        if parallel_config.is_heterogeneous_tp:
+            my_tp = parallel_config.get_tp_size_for_dp(dp_rank)
+            parallel_config.tensor_parallel_size = my_tp
+            parallel_config.world_size = (
+                parallel_config.pipeline_parallel_size
+                * my_tp
+                * parallel_config.prefill_context_parallel_size
+            )
 
         EngineCoreActorMixin.__init__(
             self, vllm_config, addresses, dp_rank, local_dp_rank

@@ -64,6 +64,21 @@ def divide(numerator, denominator):
     return numerator // denominator
 
 
+def _validate_tp_sharding_ratios(
+    tp_size: int, tp_sharding_ratios: list[int]
+) -> None:
+    if len(tp_sharding_ratios) != tp_size:
+        raise ValueError(
+            f"tp_sharding_ratios length {len(tp_sharding_ratios)} must "
+            f"equal tp_size {tp_size}."
+        )
+    if any(ratio <= 0 for ratio in tp_sharding_ratios):
+        raise ValueError(
+            "tp_sharding_ratios entries must be positive integers, got "
+            f"{tp_sharding_ratios}."
+        )
+
+
 def get_tp_partition_size(
     total_size: int,
     tp_rank: int,
@@ -86,6 +101,7 @@ def get_tp_partition_size(
         return total_size
     if tp_sharding_ratios is None:
         return divide(total_size, tp_size)
+    _validate_tp_sharding_ratios(tp_size, tp_sharding_ratios)
     total_ratio = sum(tp_sharding_ratios)
     sizes = [total_size * r // total_ratio for r in tp_sharding_ratios]
     # Assign remainder to the last rank
@@ -108,6 +124,7 @@ def get_tp_partition_offset(
         return 0
     if tp_sharding_ratios is None:
         return tp_rank * divide(total_size, tp_size)
+    _validate_tp_sharding_ratios(tp_size, tp_sharding_ratios)
     total_ratio = sum(tp_sharding_ratios)
     offset = 0
     for i in range(tp_rank):
