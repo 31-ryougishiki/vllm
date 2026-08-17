@@ -671,16 +671,26 @@ class MoERunner(MoERunnerInterface):
         fused_output = self.apply_routed_output_transform(fused_output)
 
         if shared_output is not None:
-            # Under heterogeneous TP, the shared expert processes padded
-            # tokens while the routed expert output is already unpadded
-            # by the EP all_gather + ragged unpad path.  Pad the routed
-            # output back so sizes match; down-stream residual handling
-            # (e.g. _maybe_chunk_residual_impl) expects padded tensors.
+            # Under heterogeneous TP the token counts of the two MoE branches
+            # can differ in either direction: the shared expert processes the
+            # local SP-padded stream while the routed expert output is
+            # unpadded by the EP all_gather + ragged unpad path (shared >
+            # routed), or the EP gather keeps a uniform padded slot while the
+            # shared stream is only padded to the local tp_size (routed >
+            # shared).  Pad the shorter branch so sizes match; downstream
+            # residual handling (e.g. _maybe_chunk_residual_impl) expects
+            # padded tensors.
             if shared_output.shape[0] != fused_output.shape[0]:
-                fused_output = torch.nn.functional.pad(
-                    fused_output,
-                    (0, 0, 0, shared_output.shape[0] - fused_output.shape[0]),
-                )
+                if fused_output.shape[0] < shared_output.shape[0]:
+                    fused_output = torch.nn.functional.pad(
+                        fused_output,
+                        (0, 0, 0, shared_output.shape[0] - fused_output.shape[0]),
+                    )
+                else:
+                    shared_output = torch.nn.functional.pad(
+                        shared_output,
+                        (0, 0, 0, fused_output.shape[0] - shared_output.shape[0]),
+                    )
             result = shared_output + fused_output
         else:
             result = fused_output
