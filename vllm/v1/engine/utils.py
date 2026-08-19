@@ -331,6 +331,16 @@ def set_device_control_env_var(
     value = get_device_indices(
         evar, local_dp_rank, world_size, local_world_size, offset=offset
     )
+    if parallel_config.is_heterogeneous_tp:
+        logger.info(
+            "Isolating engine subprocess devices: global_dp_rank=%s, "
+            "local_dp_rank=%s, tp_size=%s, %s=%s",
+            dp_rank,
+            local_dp_rank,
+            parallel_config.get_tp_size_for_dp(dp_rank),
+            evar,
+            value,
+        )
     with patch.dict(os.environ, values=((evar, value),)):
         yield
 
