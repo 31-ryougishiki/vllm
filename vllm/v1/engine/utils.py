@@ -156,12 +156,14 @@ class CoreEngineProcManager:
 
         self.processes: list[BaseProcess] = []
         local_dp_ranks = []
+        global_dp_ranks = []
         for index in range(local_engine_count):
             local_index = local_start_index + index
             global_index = start_index + index
 
             # Start EngineCore in background process.
             local_dp_ranks.append(local_index)
+            global_dp_ranks.append(global_index)
             self.processes.append(
                 context.Process(
                     target=EngineCoreProc.run_engine_core,
@@ -176,7 +178,9 @@ class CoreEngineProcManager:
         self.failed_proc_name: str | None = None
 
         try:
-            for proc, local_dp_rank in zip(self.processes, local_dp_ranks):
+            for proc, local_dp_rank, global_dp_rank in zip(
+                self.processes, local_dp_ranks, global_dp_ranks
+            ):
                 # Adjust device control in DP for platforms that cannot rely
                 # on torch.accelerator.set_device_index(), and for Ray launchers.
                 device_control_context: contextlib.AbstractContextManager[None] = (
@@ -189,7 +193,9 @@ class CoreEngineProcManager:
                     needs_device_env_isolation or vllm_config.parallel_config.use_ray
                 ):
                     device_control_context = set_device_control_env_var(
-                        vllm_config, local_dp_rank
+                        vllm_config,
+                        local_dp_rank,
+                        global_dp_rank=global_dp_rank,
                     )
 
                 with (
@@ -283,7 +289,9 @@ class SignalCallback:
 
 @contextlib.contextmanager
 def set_device_control_env_var(
-    vllm_config: VllmConfig, local_dp_rank: int
+    vllm_config: VllmConfig,
+    local_dp_rank: int,
+    global_dp_rank: int | None = None,
 ) -> Iterator[None]:
     """
     Temporarily set CUDA_VISIBLE_DEVICES or equivalent
@@ -296,14 +304,30 @@ def set_device_control_env_var(
 
     offset = None
     if parallel_config.is_heterogeneous_tp:
-        offset = parallel_config.get_rank_offset_for_dp(local_dp_rank)
-        # Use target DP rank's world_size, not the launcher's (DP0's)
-        dp_tp = parallel_config.get_tp_size_for_dp(local_dp_rank)
+        # ``local_dp_rank`` is the index inside this front-end process while
+        # the per-DP tp sizes are keyed by the GLOBAL dp rank.  In external DP
+        # LB mode a dp_rank=1 front-end manages local engine 0, so using
+        # local_dp_rank here would wrongly select dp0's tp_size=3 and expose
+        # only 3 devices to a tp=4 engine.
+        dp_rank = (
+            global_dp_rank
+            if global_dp_rank is not None
+            else parallel_config.data_parallel_rank + local_dp_rank
+        )
+        dp_tp = parallel_config.get_tp_size_for_dp(dp_rank)
         local_world_size = (
             dp_tp
             * parallel_config.pipeline_parallel_size
             * parallel_config.prefill_context_parallel_size
         ) // parallel_config.nnodes_within_dp
+        # External DP LB front-ends are already launched with exactly the
+        # cards of their own DP rank visible (logical ids 0..tp-1), so the
+        # engine subprocess must start at offset 0.  Internal DP front-ends
+        # still see the whole node and need the global physical offset.
+        if parallel_config.local_engines_only:
+            offset = 0
+        else:
+            offset = parallel_config.get_rank_offset_for_dp(dp_rank)
     value = get_device_indices(
         evar, local_dp_rank, world_size, local_world_size, offset=offset
     )
