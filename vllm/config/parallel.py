@@ -792,7 +792,21 @@ class ParallelConfig:
 
     @property
     def local_world_size(self) -> int:
-        return self.world_size // self.nnodes_within_dp
+        # Under heterogeneous TP the worker's world_size field may still hold
+        # the launcher-wide value (e.g. DP0's 3 after unpickling) or the
+        # global CLI value (4).  Always derive the per-process local size from
+        # this DP rank's heterogeneous_dp_config entry so the device-count
+        # check in the worker matches the number of visible NPUs.
+        if self.is_heterogeneous_tp:
+            my_tp = self.get_tp_size_for_dp(self.data_parallel_rank)
+            world_size = (
+                self.pipeline_parallel_size
+                * my_tp
+                * self.prefill_context_parallel_size
+            )
+        else:
+            world_size = self.world_size
+        return world_size // self.nnodes_within_dp
 
     @staticmethod
     def has_unfinished_dp(dp_group: ProcessGroup, has_unfinished: bool) -> bool:
